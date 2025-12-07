@@ -1,0 +1,182 @@
+{
+    "Agent Core": {
+        "path": "worker/agents",
+        "components": [
+            "worker.agents.assistants.assistant.Assistant",
+            "worker.agents.core.simpleGeneratorAgent.SimpleCodeGeneratorAgent",
+            "worker.agents.core.stateMigration.StateMigration",
+            "worker.agents.domain.pure.DependencyManagement.DependencyManagement",
+            "worker.agents.domain.pure.FileProcessing.FileProcessing",
+            "worker.agents.git.git-clone-service.GitCloneService",
+            "worker.agents.inferutils.config.types.AgentConfig",
+            "worker.agents.inferutils.infer.InferenceParamsStructured",
+            "worker.agents.inferutils.schemaFormatters.TemplateRegistryEntry",
+            "worker.agents.operations.common.AgentOperation",
+            "worker.agents.output-formats.diff-formats.udiff.DiffSecurityValidator",
+            "worker.agents.output-formats.streaming-formats.base.CodeGenerationFormat",
+            "worker.agents.services.implementations.BaseAgentService.BaseAgentService",
+            "worker.agents.services.interfaces.IDeploymentManager.IDeploymentManager",
+            "worker.agents.services.interfaces.IDeploymentManager.DeploymentResult",
+            "worker.agents.tools.mcpManager.MCPManager",
+            "worker.agents.tools.types.MCPServerConfig",
+            "worker.agents.tools.types.MCPResult",
+            "worker.agents.utils.idGenerator.IdGenerator"
+        ],
+        "children": {}
+    },
+    "API Controllers": {
+        "path": "worker/api/controllers",
+        "components": [
+            "worker.api.controllers.agent.controller.CodingAgentController",
+            "worker.api.controllers.appView.controller.AppViewController",
+            "worker.api.controllers.appView.types.GeneratedCodeFile",
+            "worker.api.controllers.auth.controller.AuthController",
+            "worker.api.controllers.baseController.BaseController",
+            "worker.api.controllers.githubExporter.controller.GitHubExporterController",
+            "worker.api.controllers.githubExporter.controller.GitHubExportData",
+            "worker.api.controllers.modelConfig.controller.ModelConfigController",
+            "worker.api.controllers.modelProviders.controller.ModelProvidersController",
+            "worker.api.controllers.screenshots.controller.ScreenshotsController",
+            "worker.api.controllers.secrets.controller.SecretsController",
+            "worker.api.controllers.sentry.tunnelController.SentryTunnelController",
+            "worker.api.controllers.stats.controller.StatsController",
+            "worker.api.controllers.status.controller.StatusController",
+            "worker.api.controllers.user.controller.UserController"
+        ],
+        "children": {}
+    },
+    "API Types and Routing": {
+        "path": "worker/api/types",
+        "components": [
+            "worker.api.types.route-context.RouteParamConfig"
+        ],
+        "children": {}
+    },
+    "Database Services and Types": {
+        "path": "worker/database",
+        "components": [
+            "worker.database.services.BaseService.BaseService",
+            "worker.database.types.AppForForkResult",
+            "worker.database.types.BaseAppQueryOptions",
+            "worker.database.types.BoardStats",
+            "worker.database.types.TeamStats",
+            "worker.database.types.SimpleAppCreation",
+            "worker.database.types.OperationResult"
+        ],
+        "children": {}
+    },
+    "Sandbox and Execution Environment": {
+        "path": "worker/services/sandbox",
+        "components": [
+            "worker.services.sandbox.BaseSandboxService.TemplateInfo",
+            "worker.services.sandbox.BaseSandboxService.StreamEvent",
+            "worker.services.sandbox.fileTreeBuilder.FileTreeBuilder",
+            "worker.services.sandbox.request-handler.SandboxEnv",
+            "worker.services.sandbox.sandboxSdkClient.StreamEvent",
+            "worker.services.sandbox.sandboxTypes.GitHubUserInfo",
+            "worker.services.sandbox.types.WranglerConfigValidationResult",
+            "worker.services.sandbox.types.ResourceProvisioningOptions",
+            "worker.services.sandbox.zipExtractor.ZipExtractor"
+        ],
+        "children": {}
+    },
+    "GitHub Integration": {
+        "path": "worker/services/github",
+        "components": [
+            "worker.services.github.GitHubService.GitHubService",
+            "worker.services.github.types.GitHubServiceConfig",
+            "worker.services.github.types.GitHubUserAccessToken",
+            "worker.services.github.types.GitHubTokenResult"
+        ],
+        "children": {}
+    },
+    "Rate Limiting and Caching": {
+        "path": "worker/services/rate-limit",
+        "components": [
+            "worker.services.rate-limit.KVRateLimitStore.KVRateLimitStore",
+            "worker.services.rate-limit.config.RateLimitConfigBase",
+            "worker.services.rate-limit.rateLimits.RateLimitService"
+        ],
+        "children": {}
+    },
+    "Cache and CSRF": {
+        "path": "worker/services",
+        "components": [
+            "worker.services.cache.KVCache.KVCacheOptions",
+            "worker.services.csrf.CsrfService.CsrfService"
+        ],
+        "children": {}
+    },
+    "Logger": {
+        "path": "worker/logger/core.ts",
+        "components": [
+            "worker.logger.core.LoggerFactory"
+        ],
+        "children": {}
+    },
+    "Validation Utilities": {
+        "path": "worker/utils/validationUtils.ts",
+        "components": [
+            "worker.utils.validationUtils.ValidationField"
+        ],
+        "children": {}
+    },
+    "Authentication Types": {
+        "path": "worker/types/auth-types.ts",
+        "components": [
+            "worker.types.auth-types.OAuthTokens"
+        ],
+        "children": {}
+    },
+    "Frontend API Types": {
+        "path": "src/api-types.ts",
+        "components": [
+            "src.api-types.FileType",
+            "src.api-types.StreamingResponse"
+        ],
+        "children": {}
+    },
+    "Frontend API Client and Events": {
+        "path": "src/lib",
+        "components": [
+            "src.lib.api-client.ApiClient",
+            "src.lib.api-client.PaginationParams",
+            "src.lib.app-events.AppDeletedEvent",
+            "src.lib.app-events.AppEventEmitter"
+        ],
+        "children": {}
+    },
+    "Frontend Components": {
+        "path": "src/components",
+        "components": [
+            "src.components.image-attachment-preview.ImageAttachmentPreviewProps",
+            "src.components.model-config-tabs.AgentDisplayConfig",
+            "src.components.shared.AppFiltersForm.AppFiltersFormProps"
+        ],
+        "children": {}
+    },
+    "Frontend Contexts and Hooks": {
+        "path": "src/contexts",
+        "components": [
+            "src.contexts.theme-context.ThemeContextType"
+        ],
+        "children": {}
+    },
+    "Frontend Utilities": {
+        "path": "src/utils",
+        "components": [
+            "src.utils.logger.Logger",
+            "src.utils.ndjson-parser.ndjson-parser.NDJSONStreamParser",
+            "src.utils.screenshot.AutoScreenshotSystem"
+        ],
+        "children": {}
+    },
+    "Deployment Scripts": {
+        "path": "scripts",
+        "components": [
+            "scripts.deploy.CloudflareDeploymentManager",
+            "scripts.undeploy.CloudflareUndeploymentManager"
+        ],
+        "children": {}
+    }
+}
