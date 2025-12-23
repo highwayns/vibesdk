@@ -329,6 +329,7 @@ class FunctionDesignRestorer:
         # Progress / debug controls (set from CLI)
         self._progress: bool = False
         self._progress_every: int = 20
+        self._progress_methods_every: int = 200
         self._debug_callgraph: bool = False
 
         # Build a static call graph index so we can resolve "screen -> other" DB access.
@@ -450,21 +451,14 @@ class FunctionDesignRestorer:
             mids = self._methods_by_class_and_name.get((class_full, name)) or []
             if not mids:
                 return []
-            # If we don't know arg_count, return a small cap.
             if arg_count < 0:
-                return list(mids)[:10]
+                return list(mids)
             out: List[str] = []
             for mid in mids:
                 pc = (self._method_index.get(mid) or {}).get('param_count', -1)
                 if pc in (arg_count, -1):
                     out.append(mid)
-            if out:
-                return out[:10]
-            # Fallback: GeneXus-generated code sometimes calls through wrappers (arg_count mismatch).
-            # If there is only one overload, accept it; otherwise accept a small cap.
-            if len(mids) == 1:
-                return [mids[0]]
-            return list(mids)[:3]
+            return out
 
         cands: List[str] = []
 
@@ -472,11 +466,10 @@ class FunctionDesignRestorer:
         if not qualifier or qualifier in ('this', 'super'):
             cands.extend(pick_in_class(caller_class_full))
 
-        # 2) Qualified by a class-like name (including GeneXus lower-case class names)
-        if qualifier:
-            if qualifier in self._class_fulls_by_class_name or _looks_like_class_name(qualifier):
-                for cls_full in self._class_fulls_by_class_name.get(qualifier, []) or []:
-                    cands.extend(pick_in_class(cls_full))
+        # 2) Qualified by a class-like name (static call)
+        if qualifier and _looks_like_class_name(qualifier):
+            for cls_full in self._class_fulls_by_class_name.get(qualifier, []) or []:
+                cands.extend(pick_in_class(cls_full))
 
         # 3) If still empty, try restricting to caller's referenced types
         if not cands:
@@ -496,12 +489,7 @@ class FunctionDesignRestorer:
                 if len(cands) >= 20:
                     break
 
-        # If still empty and arg_count is known, relax arg_count filtering a bit to allow traversal.
-        # This is safe because downstream traversal is capped by call_max_nodes/depth.
-        if not cands and arg_count >= 0:
-            cands.extend((self._methods_by_name.get(name) or [])[:10])
-
-# Deduplicate + cap
+        # Deduplicate + cap
         seen = set()
         uniq: List[str] = []
         for c in cands:
@@ -554,6 +542,16 @@ class FunctionDesignRestorer:
         columns_used_map: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         related_classes: Set[str] = set()
 
+        # Progress stats for this class (method-level)
+        _cg_t0 = time.perf_counter()
+        _cg_cache_hits = 0
+        _cg_tables: Set[str] = set()
+        if self._progress:
+            print(
+                f"[progress] callgraph start: {class_name} entry_methods={len(entry_method_ids)} max_depth={self._call_max_depth} max_nodes={self._call_max_nodes}",
+                file=sys.stderr,
+            )
+
         while queue and len(visited) < self._call_max_nodes:
             mid, depth = queue.popleft()
             if mid in visited:
@@ -566,6 +564,14 @@ class FunctionDesignRestorer:
                     file=sys.stderr,
                 )
 
+            if self._progress and self._progress_methods_every and (len(visited) % self._progress_methods_every == 0):
+                _cg_dt = time.perf_counter() - _cg_t0
+                _cg_rate = (len(visited) / _cg_dt) if _cg_dt > 0 else 0.0
+                print(
+                    f"[progress] callgraph {class_name}: visited={len(visited)}/{self._call_max_nodes} queue={len(queue)} depth={depth} refs={len(all_refs)} tables={len(_cg_tables)} cache_hit={_cg_cache_hits}/{len(visited)} rate={_cg_rate:.1f} m/s",
+                    file=sys.stderr,
+                )
+
             rec = self._method_index.get(mid) or {}
             text = rec.get('text') or ''
             src_class = rec.get('class_name') or class_name
@@ -573,6 +579,7 @@ class FunctionDesignRestorer:
 
             # Extract refs (cached)
             if mid in self._method_refs_cache:
+                _cg_cache_hits += 1
                 refs = self._method_refs_cache[mid]
                 cols_map = self._method_columns_cache.get(mid) or {}
             else:
@@ -591,6 +598,8 @@ class FunctionDesignRestorer:
                 self._method_columns_cache[mid] = cols_map
 
             all_refs.extend(refs)
+            if refs:
+                _cg_tables.update({r.table_name.upper() for r in refs if r.table_name})
             for t, cols in (cols_map or {}).items():
                 # merge unique column dicts by name
                 existing = {c.get('name') for c in columns_used_map.get(t, [])}
@@ -612,6 +621,14 @@ class FunctionDesignRestorer:
                     callee_cls_full = (self._method_index.get(cmid) or {}).get('class_full')
                     if callee_cls_full and callee_cls_full != class_full:
                         related_classes.add((self._class_index.get(callee_cls_full) or {}).get('class_name', callee_cls_full))
+
+        if self._progress:
+            _cg_dt = time.perf_counter() - _cg_t0
+            _cg_rate = (len(visited) / _cg_dt) if _cg_dt > 0 else 0.0
+            print(
+                f"[progress] callgraph done : {class_name} visited={len(visited)} refs={len(all_refs)} tables={len(_cg_tables)} related_classes={len(related_classes)} cache_hit={_cg_cache_hits}/{len(visited) if visited else 0} time={_cg_dt:.1f}s rate={_cg_rate:.1f} m/s",
+                file=sys.stderr,
+            )
 
         return all_refs, columns_used_map, related_classes
     
@@ -1065,6 +1082,8 @@ def main():
                         help="実行進捗を stderr に出力する")
     parser.add_argument("--progress-every", type=int, default=20,
                         help="進捗表示の間隔（N件ごと） (default: 20)")
+    parser.add_argument("--progress-methods-every", type=int, default=200,
+                        help="コールグラフ進捗表示の間隔（メソッド訪問 N件ごと） (default: 200)")
     parser.add_argument("--debug-callgraph", action="store_true",
                         help="コールグラフ追跡の詳細ログを出力（重いので注意）")
 
@@ -1090,6 +1109,7 @@ def main():
     restorer = FunctionDesignRestorer(java_structure, db_metadata)
     restorer._progress = bool(args.progress)
     restorer._progress_every = max(1, int(args.progress_every))
+    restorer._progress_methods_every = max(1, int(args.progress_methods_every))
     restorer._debug_callgraph = bool(args.debug_callgraph)
     # Override traversal limits from CLI
     restorer._call_max_depth = max(0, int(args.call_depth))
