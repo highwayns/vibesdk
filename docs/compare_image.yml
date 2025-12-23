@@ -1,0 +1,322 @@
+app:
+  description: 比较两组图片中红色标注区域的内容，判断是否一致
+  icon: 🔍
+  icon_background: '#FF6B6B'
+  mode: workflow
+  name: PDF红框区域比较工作流
+  use_icon_as_answer_icon: true
+dependencies:
+- current_identifier: null
+  type: marketplace
+  value:
+    marketplace_plugin_unique_identifier: langgenius/openai:0.2.6@e2665624a156f52160927bceac9e169bd7e5ae6b936ae82575e14c90af390e6e
+kind: app
+version: 0.1.5
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      allowed_file_extensions:
+      - .png
+      - .jpg
+      - .jpeg
+      allowed_file_types:
+      - image
+      allowed_file_upload_methods:
+      - local_file
+      - remote_url
+      enabled: true
+      fileUploadConfig:
+        audio_file_size_limit: 50
+        batch_count_limit: 5
+        file_size_limit: 15
+        image_file_size_limit: 10
+        video_file_size_limit: 100
+        workflow_file_upload_limit: 10
+      image:
+        enabled: false
+        number_limits: 3
+        transfer_methods:
+        - local_file
+        - remote_url
+      number_limits: 20
+    opening_statement: ''
+    retriever_resource:
+      enabled: false
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    suggested_questions: []
+    suggested_questions_after_answer:
+      enabled: false
+    text_to_speech:
+      enabled: false
+      language: ''
+      voice: ''
+  graph:
+    edges:
+    - data:
+        isInIteration: false
+        sourceType: llm
+        targetType: code
+      id: compare-to-format
+      selected: false
+      source: compare_regions
+      sourceHandle: source
+      target: format_result
+      targetHandle: target
+      type: custom
+    - data:
+        isInIteration: false
+        sourceType: code
+        targetType: end
+      id: format-to-end
+      selected: false
+      source: format_result
+      sourceHandle: source
+      target: end
+      targetHandle: target
+      type: custom
+    - data:
+        isInLoop: false
+        sourceType: start
+        targetType: llm
+      id: start-source-compare_regions-target
+      source: start
+      sourceHandle: source
+      target: compare_regions
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    nodes:
+    - data:
+        desc: 接收两组待比较的图片
+        selected: false
+        title: 开始
+        type: start
+        variables:
+        - allowed_file_extensions: []
+          allowed_file_types:
+          - image
+          allowed_file_upload_methods:
+          - local_file
+          - remote_url
+          label: 图
+          max_length: 10
+          options: []
+          required: true
+          type: file
+          variable: images_group
+        - default: 语义相似
+          label: 比较模式
+          options:
+          - 严格匹配
+          - 语义相似
+          - 仅检查关键信息
+          required: false
+          type: select
+          variable: compare_mode
+        - label: item_index
+          max_length: 48
+          options: []
+          required: true
+          type: number
+          variable: item_index
+      height: 170
+      id: start
+      position:
+        x: 302.5
+        y: 280
+      positionAbsolute:
+        x: 302.5
+        y: 280
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        context:
+          enabled: false
+          variable_selector: []
+        desc: 使用视觉模型比较两组图片中红框区域的内容
+        model:
+          completion_params:
+            max_tokens: 4096
+            response_format: text
+            temperature: 0.1
+          mode: chat
+          name: gpt-4-turbo
+          provider: langgenius/openai/openai
+        prompt_template:
+        - id: system-prompt
+          role: system
+          text: '            あなたはプロの文書比較アナリストです。1枚の比較画像が与えられます。左側は「元の版」、右側は「比較版」です。
+
+
+
+                        ## あなたのタスク
+
+                        1. 左右の内容を注意深く観察する
+
+                        2. 一致しているか判定する
+
+                        3. 差異があれば、差分点を具体的に説明する
+
+
+
+                        ## 比較モード
+
+                        - **厳密一致**: 文字・数字・体裁まで完全に一致していること
+
+                        - **意味的類似**: 表現が異なっても意味が同じなら一致とみなす
+
+                        - **重要情報のみ確認**: 重要データ（数値・日付・金額など）だけを見る
+
+
+
+                        ## 出力形式（必ず JSON で厳守）
+
+                        ```json
+
+                        {
+
+                          "is_match": trueまたはfalse,
+
+                          "match_type": "完全一致" または "意味一致" または "部分一致" または "不一致",
+
+                          "confidence": 0.0から1.0の数値,
+
+                          "left_content": "左側（元の版）の主要内容サマリ",
+
+                          "right_content": "右側（比較版）の主要内容サマリ",
+
+                          "differences": "差異説明（一致なら空文字）",
+
+                          "details": "詳細な分析"
+
+                        }
+
+                        ```
+
+
+
+                        重要：JSON のみを出力し、他の文章は出力しない。'
+        - id: user-prompt
+          role: user
+          text: '            この比較画像の左右の内容を比較してください。
+
+
+
+                        比較モード：{{#start.compare_mode#}}
+
+
+
+                        よく確認したうえで、JSON 形式で比較結果を出力してください。'
+        selected: false
+        title: 视觉对比分析
+        type: llm
+        variables: []
+        vision:
+          configs:
+            detail: high
+            variable_selector:
+            - start
+            - images_group
+          enabled: true
+      height: 134
+      id: compare_regions
+      position:
+        x: 641.25
+        y: 280
+      positionAbsolute:
+        x: 641.25
+        y: 280
+      selected: true
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        code: "import json\nimport re\n\ndef main(llm_output: str, item_index: int)\
+          \ -> dict:\n    \"\"\"LLM の比較結果を解析\"\"\"\n    result = {\n        \"index\"\
+          : item_index,\n        \"is_match\": False,\n        \"match_type\": \"\
+          解析失敗\",\n        \"confidence\": 0.0,\n        \"left_content\": \"\",\n\
+          \        \"right_content\": \"\",\n        \"differences\": \"\",\n    \
+          \    \"details\": \"\",\n        \"parse_success\": False\n    }\n\n   \
+          \ try:\n        # 直接解析を試みる\n        data = json.loads(llm_output)\n    \
+          \    result.update(data)\n        result[\"parse_success\"] = True\n   \
+          \     result[\"index\"] = item_index\n    except:\n        # JSON コードブロックの抽出を試みる\n\
+          \        match = re.search(r'```(?:json)?\\s*([\\s\\S]*?)\\s*```', llm_output)\n\
+          \        if match:\n            try:\n                data = json.loads(match.group(1))\n\
+          \                result.update(data)\n                result[\"parse_success\"\
+          ] = True\n                result[\"index\"] = item_index\n            except:\n\
+          \                result[\"details\"] = llm_output\n        else:\n     \
+          \       # JSON オブジェクトの抽出を試みる\n            match = re.search(r'\\{[\\s\\\
+          S]*\\}', llm_output)\n            if match:\n                try:\n    \
+          \                data = json.loads(match.group(0))\n                   \
+          \ result.update(data)\n                    result[\"parse_success\"] = True\n\
+          \                    result[\"index\"] = item_index\n                except:\n\
+          \                    result[\"details\"] = llm_output\n            else:\n\
+          \                result[\"details\"] = llm_output\n\n    return {\"result\"\
+          : result}\n"
+        code_language: python3
+        desc: 将比较结果格式化为易读的报告
+        outputs:
+          result:
+            children: null
+            type: object
+        selected: false
+        title: 格式化报告
+        type: code
+        variables:
+        - value_selector:
+          - compare_regions
+          - text
+          variable: llm_output
+        - value_selector:
+          - start
+          - item_index
+          variable: item_index
+      height: 82
+      id: format_result
+      position:
+        x: 958.75
+        y: 280
+      positionAbsolute:
+        x: 958.75
+        y: 280
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        desc: 输出比较结果报告
+        outputs:
+        - value_selector:
+          - format_result
+          - result
+          variable: result
+        selected: false
+        title: 结束
+        type: end
+      height: 118
+      id: end
+      position:
+        x: 1278.75
+        y: 280
+      positionAbsolute:
+        x: 1278.75
+        y: 280
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    viewport:
+      x: 105.36161297896922
+      y: 310.98482206382084
+      zoom: 0.3482202253184498
