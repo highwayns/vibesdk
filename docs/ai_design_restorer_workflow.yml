@@ -1,0 +1,690 @@
+app:
+  description: ai_design_restorer workflow (generated from DIFY_WORKFLOW.md)
+  icon: 🧩
+  icon_background: '#E0F2FE'
+  mode: workflow
+  name: AI Design Restorer
+  use_icon_as_answer_icon: false
+dependencies:
+- current_identifier: null
+  type: marketplace
+  value:
+    marketplace_plugin_unique_identifier: langgenius/openai:0.2.6@e2665624a156f52160927bceac9e169bd7e5ae6b936ae82575e14c90af390e6e
+kind: app
+version: 0.1.5
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      allowed_file_extensions:
+      - .JPG
+      - .JPEG
+      - .PNG
+      - .GIF
+      - .WEBP
+      - .SVG
+      allowed_file_types:
+      - image
+      allowed_file_upload_methods:
+      - local_file
+      - remote_url
+      enabled: false
+      fileUploadConfig:
+        audio_file_size_limit: 50
+        batch_count_limit: 5
+        file_size_limit: 15
+        image_file_size_limit: 10
+        video_file_size_limit: 100
+        workflow_file_upload_limit: 10
+      image:
+        enabled: false
+        number_limits: 3
+        transfer_methods:
+        - local_file
+        - remote_url
+      number_limits: 3
+    opening_statement: ''
+    retriever_resource:
+      enabled: false
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    suggested_questions: []
+    suggested_questions_after_answer:
+      enabled: false
+    text_to_speech:
+      enabled: false
+      language: ''
+      voice: ''
+  graph:
+    edges:
+    - data:
+        sourceType: start
+        targetType: if-else
+        isInLoop: false
+      id: start-source-route_task-target
+      selected: false
+      source: start
+      sourceHandle: source
+      target: route_task
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: if-else
+        targetType: llm
+      id: route_task-d4e93d5c-2b02-4435-83d9-266d6fe05cfc-llm_system_overview
+      selected: false
+      source: route_task
+      sourceHandle: d4e93d5c-2b02-4435-83d9-266d6fe05cfc
+      target: llm_system_overview
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: if-else
+        targetType: llm
+      id: route_task-d9d4fb13-fa8c-48d3-b000-942bb5f3b65d-llm_function_intents
+      selected: false
+      source: route_task
+      sourceHandle: d9d4fb13-fa8c-48d3-b000-942bb5f3b65d
+      target: llm_function_intents
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: if-else
+        targetType: llm
+      id: route_task-366217f4-b7f2-4b7f-983e-7fad5ebbab67-llm_function_card
+      selected: false
+      source: route_task
+      sourceHandle: 366217f4-b7f2-4b7f-983e-7fad5ebbab67
+      target: llm_function_card
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: if-else
+        targetType: llm
+      id: route_task-fb2d6f70-07f2-4543-839d-d884f7f9c91b-llm_function_flow
+      selected: false
+      source: route_task
+      sourceHandle: fb2d6f70-07f2-4543-839d-d884f7f9c91b
+      target: llm_function_flow
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: if-else
+        targetType: code
+      id: route_task-false-select_result
+      selected: false
+      source: route_task
+      sourceHandle: 'false'
+      target: select_result
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: llm
+        targetType: code
+      id: llm_system_overview-to-select_result
+      selected: false
+      source: llm_system_overview
+      sourceHandle: source
+      target: select_result
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: llm
+        targetType: code
+      id: llm_function_intents-to-select_result
+      selected: false
+      source: llm_function_intents
+      sourceHandle: source
+      target: select_result
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: llm
+        targetType: code
+      id: llm_function_card-to-select_result
+      selected: false
+      source: llm_function_card
+      sourceHandle: source
+      target: select_result
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: llm
+        targetType: code
+      id: llm_function_flow-to-select_result
+      selected: false
+      source: llm_function_flow
+      sourceHandle: source
+      target: select_result
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: code
+        targetType: end
+      id: select_result-to-end
+      selected: false
+      source: select_result
+      sourceHandle: source
+      target: end
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    nodes:
+    - data:
+        desc: ''
+        selected: false
+        title: Start
+        type: start
+        variables:
+        - label: task
+          max_length: 48
+          options:
+          - system_overview
+          - function_intents
+          - function_card
+          - function_flow
+          required: true
+          type: select
+          variable: task
+        - label: tables_summary (JSON string)
+          max_length: 1024
+          options: []
+          required: false
+          type: paragraph
+          variable: tables_summary
+        - label: functions_summary (JSON string)
+          max_length: 1024
+          options: []
+          required: false
+          type: paragraph
+          variable: functions_summary
+        - label: need_overview
+          max_length: 8
+          options:
+          - 'true'
+          - 'false'
+          required: false
+          type: select
+          variable: need_overview
+        - label: function (JSON string)
+          max_length: 1024
+          options: []
+          required: false
+          type: paragraph
+          variable: function
+        - label: tables (JSON string)
+          max_length: 1024
+          options: []
+          required: false
+          type: paragraph
+          variable: tables
+        - label: relationships (JSON string)
+          max_length: 1024
+          options: []
+          required: false
+          type: paragraph
+          variable: relationships
+        - label: schema_hint (JSON string)
+          max_length: 1024
+          options: []
+          required: false
+          type: paragraph
+          variable: schema_hint
+        - label: function_id
+          max_length: 128
+          options: []
+          required: false
+          type: text-input
+          variable: function_id
+        - label: card (JSON string)
+          max_length: 1024
+          options: []
+          required: false
+          type: paragraph
+          variable: card
+        - label: crud_context (JSON string)
+          max_length: 1024
+          options: []
+          required: false
+          type: paragraph
+          variable: crud_context
+      height: 340
+      id: start
+      position:
+        x: 50
+        y: 200
+      positionAbsolute:
+        x: 50
+        y: 200
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 320
+    - data:
+        cases:
+        - case_id: d4e93d5c-2b02-4435-83d9-266d6fe05cfc
+          conditions:
+          - comparison_operator: '='
+            id: be8e09e2-d429-4167-875f-92b4289b207c
+            value: system_overview
+            varType: string
+            variable_selector:
+            - start
+            - task
+          id: d4e93d5c-2b02-4435-83d9-266d6fe05cfc
+          logical_operator: and
+        - case_id: d9d4fb13-fa8c-48d3-b000-942bb5f3b65d
+          conditions:
+          - comparison_operator: '='
+            id: 6e625b21-2533-4033-821c-a247440002f3
+            value: function_intents
+            varType: string
+            variable_selector:
+            - start
+            - task
+          id: d9d4fb13-fa8c-48d3-b000-942bb5f3b65d
+          logical_operator: and
+        - case_id: 366217f4-b7f2-4b7f-983e-7fad5ebbab67
+          conditions:
+          - comparison_operator: '='
+            id: a00990d3-853c-4149-a8d3-c88d6f9d93ae
+            value: function_card
+            varType: string
+            variable_selector:
+            - start
+            - task
+          id: 366217f4-b7f2-4b7f-983e-7fad5ebbab67
+          logical_operator: and
+        - case_id: fb2d6f70-07f2-4543-839d-d884f7f9c91b
+          conditions:
+          - comparison_operator: '='
+            id: 7ba9960c-d74e-4815-8e19-b40943c578be
+            value: function_flow
+            varType: string
+            variable_selector:
+            - start
+            - task
+          id: fb2d6f70-07f2-4543-839d-d884f7f9c91b
+          logical_operator: and
+        desc: ''
+        selected: false
+        title: IF / Switch (task)
+        type: if-else
+      height: 200
+      id: route_task
+      position:
+        x: 420
+        y: 220
+      positionAbsolute:
+        x: 420
+        y: 220
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 320
+    - data:
+        context:
+          enabled: false
+          variable_selector: []
+        desc: ''
+        model:
+          completion_params:
+            temperature: 0.2
+            max_tokens: 4096
+            response_format: text
+          mode: chat
+          name: gpt-4o-mini
+          provider: langgenius/openai/openai
+        prompt_template:
+        - id: c1504f6f-86c2-4088-9557-d04a612aa5cb
+          role: system
+          text: あなたは熟練の業務システムアナリスト兼ソフトウェアアーキテクトです。入力されたテーブル構造の要約と機能一覧の要約から、システム全体の業務概要を推定し、各機能について1文で業務目的を記述してください。出力は厳密なJSONのみ（Markdown、説明文、コードブロックは出力しない）。
+        - id: 68abbfe8-be53-4f56-ad44-fe512a6b3c03
+          role: user
+          text: '入力：
+
+            - tables_summary（JSON文字列）：
+
+            {{#start.tables_summary#}}
+
+
+            - functions_summary（JSON文字列）：
+
+            {{#start.functions_summary#}}
+
+
+            要件：
+
+            1) 次を含むJSONを出力する：
+
+            - system_overview: string（システム全体の業務概要、2〜6文）
+
+            - function_intents: object（キー=機能ID、値=当該機能の業務目的を1文）
+
+
+            2) JSON以外の文字は一切出力しない。'
+        selected: false
+        title: LLM_SystemOverview
+        type: llm
+        variables: []
+        vision:
+          enabled: false
+      height: 220
+      id: llm_system_overview
+      position:
+        x: 780
+        y: 80
+      positionAbsolute:
+        x: 780
+        y: 80
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 360
+    - data:
+        context:
+          enabled: false
+          variable_selector: []
+        desc: ''
+        model:
+          completion_params:
+            temperature: 0.2
+            max_tokens: 4096
+            response_format: text
+          mode: chat
+          name: gpt-4o-mini
+          provider: langgenius/openai/openai
+        prompt_template:
+        - id: 2f9e6ec0-8af2-47e1-8e77-7bd8629481b7
+          role: system
+          text: あなたは熟練の業務システムアナリストです。入力された機能一覧要約に対し、各機能の業務目的を1文で補完してください。厳密なJSONのみを出力してください。
+        - id: 87b7f19b-26f8-4c72-90af-d06c118a7c43
+          role: user
+          text: "tables_summary：\n{{#start.tables_summary#}}\n\nfunctions_summary：\n\
+            {{#start.functions_summary#}}\n\nneed_overview：{{#start.need_overview#}}\n\
+            \n要件：\n- JSONのみを出力：\n{\n  \"function_intents\": {\n    \"機能ID\": \"1文の業務目的\"\
+            \n  }\n}"
+        selected: false
+        title: LLM_FunctionIntents
+        type: llm
+        variables: []
+        vision:
+          enabled: false
+      height: 220
+      id: llm_function_intents
+      position:
+        x: 780
+        y: 250
+      positionAbsolute:
+        x: 780
+        y: 250
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 360
+    - data:
+        context:
+          enabled: false
+          variable_selector: []
+        desc: ''
+        model:
+          completion_params:
+            temperature: 0.2
+            max_tokens: 4096
+            response_format: text
+          mode: chat
+          name: gpt-4o-mini
+          provider: langgenius/openai/openai
+        prompt_template:
+        - id: e411d3a6-d099-4f39-9a50-137d4447ea2e
+          role: system
+          text: あなたは熟練の業務アナリスト（BA）兼データモデリングの専門家です。入力された「機能概要 + テーブル/リレーション情報」から、納品可能な機能カード（Function
+            Card）を復元してください。出力は厳密なJSONのみ（Markdownは出力しない）。
+        - id: 460ebd10-7fe7-421d-adc4-68f2cc59cd92
+          role: user
+          text: 'function（JSON文字列）：
+
+            {{#start.function#}}
+
+
+            tables（JSON文字列）：
+
+            {{#start.tables#}}
+
+
+            relationships（JSON文字列）：
+
+            {{#start.relationships#}}
+
+
+            schema_hint（JSON文字列）：
+
+            {{#start.schema_hint#}}
+
+
+            要件：
+
+            1) schema_hint のキー構造に従ってJSONを出力する（詳細フィールドの補足は可。ただし既存キーの階層は変更しない）。
+
+            2) goal/actors/inputs/outputs/tables/business_rules/exceptions はできるだけ具体的に。
+
+            3) tables フィールドには本機能が関与するテーブルを列挙（テーブル名 + 日本語の論理名 + 用途/読取・書込）。
+
+            4) JSONのみを出力する。
+
+
+            補足：入力が「機能ツリー」の上位機能（feature）の場合
+
+            - `function.type` は `feature` の可能性がある
+
+            - `function.members` には下位オブジェクト（画面/バッチ）の一覧が含まれる
+
+            これを「業務機能パッケージ」として出力する：
+
+            - goal/actors は業務機能を主語にする
+
+            - inputs/outputs は外部から見える入出力として記述する
+
+            - steps/flow（後続の FunctionFlow で作成）では members を実装可能なサブ手順に分解（画面/バッチをつないで並べる）'
+        selected: false
+        title: LLM_FunctionCard
+        type: llm
+        variables: []
+        vision:
+          enabled: false
+      height: 260
+      id: llm_function_card
+      position:
+        x: 780
+        y: 420
+      positionAbsolute:
+        x: 780
+        y: 420
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 360
+    - data:
+        context:
+          enabled: false
+          variable_selector: []
+        desc: ''
+        model:
+          completion_params:
+            temperature: 0.2
+            max_tokens: 4096
+            response_format: text
+          mode: chat
+          name: gpt-4o-mini
+          provider: langgenius/openai/openai
+        prompt_template:
+        - id: 3ffb4ab0-7396-48b4-b19c-a1333f820fbf
+          role: system
+          text: あなたは熟練のシステムアナリストです。入力された機能カードとCRUD/テーブル関係情報を、実装可能な「ステップフロー」（Flow）に分解してください。厳密なJSONのみを出力してください。
+        - id: a5f93dfd-638c-4615-8dd8-876a319e7ce8
+          role: user
+          text: 'function_id：{{#start.function_id#}}
+
+
+            card（JSON文字列）：
+
+            {{#start.card#}}
+
+
+            crud_context（JSON文字列）：
+
+            {{#start.crud_context#}}
+
+
+            tables（JSON文字列）：
+
+            {{#start.tables#}}
+
+
+            relationships（JSON文字列）：
+
+            {{#start.relationships#}}
+
+
+            schema_hint（JSON文字列）：
+
+            {{#start.schema_hint#}}
+
+
+            要件：
+
+            1) schema_hint の構造に合致するJSONを出力する（通常は {"flow": {"steps": [...]}}）。
+
+            2) 各 step には次を明確に書く：トリガー/入力、主処理、読取・書込テーブル、検証と業務ルール、例外分岐、出力。
+
+            3) 大きな機能は、段階的に実装/段階的に受入できる粒度まで steps を細分化する。
+
+            4) JSONのみを出力する。'
+        selected: false
+        title: LLM_FunctionFlow
+        type: llm
+        variables: []
+        vision:
+          enabled: false
+      height: 260
+      id: llm_function_flow
+      position:
+        x: 780
+        y: 600
+      positionAbsolute:
+        x: 780
+        y: 600
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 360
+    - data:
+        code: "import json\n\ndef main(task: str, system_overview: str=None, function_intents:\
+          \ str=None, function_card: str=None, function_flow: str=None) -> dict:\n\
+          \    mapping = {\n        'system_overview': system_overview,\n        'function_intents':\
+          \ function_intents,\n        'function_card': function_card,\n        'function_flow':\
+          \ function_flow,\n    }\n    result = mapping.get(task)\n    if result is\
+          \ None:\n        return {'result': json.dumps({'error': 'Invalid task',\
+          \ 'task': task, 'allowed': list(mapping.keys())}, ensure_ascii=False)}\n\
+          \    if result is None or str(result).strip()=='' or result is False:\n\
+          \        return {'result': json.dumps({'error': 'Empty result', 'task':\
+          \ task}, ensure_ascii=False)}\n    return {'result': result}\n"
+        code_language: python3
+        desc: task に応じて該当する LLM 出力を選択し、result に統一して出力する
+        outputs:
+          result:
+            children: null
+            type: string
+        selected: false
+        title: 結果選択
+        type: code
+        variables:
+        - variable: task
+          value_selector:
+          - start
+          - task
+        - variable: system_overview
+          value_selector:
+          - llm_system_overview
+          - text
+        - variable: function_intents
+          value_selector:
+          - llm_function_intents
+          - text
+        - variable: function_card
+          value_selector:
+          - llm_function_card
+          - text
+        - variable: function_flow
+          value_selector:
+          - llm_function_flow
+          - text
+      height: 220
+      id: select_result
+      position:
+        x: 1180
+        y: 320
+      positionAbsolute:
+        x: 1180
+        y: 320
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 360
+    - data:
+        desc: result を出力
+        outputs:
+        - value_selector:
+          - select_result
+          - result
+          variable: result
+        selected: false
+        title: 終了
+        type: end
+      height: 118
+      id: end
+      position:
+        x: 1550
+        y: 320
+      positionAbsolute:
+        x: 1550
+        y: 320
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    viewport:
+      x: 0
+      y: 0
+      zoom: 0.8
