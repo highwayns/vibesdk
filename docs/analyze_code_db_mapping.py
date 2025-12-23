@@ -149,9 +149,8 @@ class FunctionDesign:
     related_functions_callgraph: List[str] = field(default_factory=list) # callgraph: 関連機能ID一覧
     related_functions_prefix: List[str] = field(default_factory=list)    # prefix: 関連機能ID一覧
     related_functions: List[str] = field(default_factory=list)           # union(callgraph,prefix)
-    related_functions_deep: List[str] = field(default_factory=list)       # deep: 関連機能ID一覧（テーブル/ER/seedから推定）
-    tables_used: List[Dict[str, Any]] = field(default_factory=list)  # 使用テーブル一覧
-    crud_matrix: Dict[str, List[str]] = field(default_factory=dict)  # CRUD操作マトリックス
+    tables_used: List[Dict[str, Any]]  # 使用テーブル一覧
+    crud_matrix: Dict[str, List[str]]  # CRUD操作マトリックス
 
 
 @dataclass
@@ -332,14 +331,6 @@ class FunctionDesignRestorer:
         self._progress_every: int = 20
         self._debug_callgraph: bool = False
 
-
-        # Deep-related search controls (related function expansion)
-        self._enable_deep_related: bool = True
-        self._deep_related_depth: int = 2
-        self._deep_related_max: int = 80
-        self._deep_table_popularity_th: int = 200
-        self._deep_table_neighbor_cap: int = 30
-        self._deep_tables_per_func: int = 3
         # Build a static call graph index so we can resolve "screen -> other" DB access.
         self._call_max_depth = int(java_structure.get('call_graph', {}).get('max_depth', 8)) if isinstance(java_structure, dict) else 8
         self._call_max_nodes = int(java_structure.get('call_graph', {}).get('max_nodes', 800)) if isinstance(java_structure, dict) else 800
@@ -459,14 +450,21 @@ class FunctionDesignRestorer:
             mids = self._methods_by_class_and_name.get((class_full, name)) or []
             if not mids:
                 return []
+            # If we don't know arg_count, return a small cap.
             if arg_count < 0:
-                return list(mids)
+                return list(mids)[:10]
             out: List[str] = []
             for mid in mids:
                 pc = (self._method_index.get(mid) or {}).get('param_count', -1)
                 if pc in (arg_count, -1):
                     out.append(mid)
-            return out
+            if out:
+                return out[:10]
+            # Fallback: GeneXus-generated code sometimes calls through wrappers (arg_count mismatch).
+            # If there is only one overload, accept it; otherwise accept a small cap.
+            if len(mids) == 1:
+                return [mids[0]]
+            return list(mids)[:3]
 
         cands: List[str] = []
 
@@ -474,10 +472,11 @@ class FunctionDesignRestorer:
         if not qualifier or qualifier in ('this', 'super'):
             cands.extend(pick_in_class(caller_class_full))
 
-        # 2) Qualified by a class-like name (static call)
-        if qualifier and _looks_like_class_name(qualifier):
-            for cls_full in self._class_fulls_by_class_name.get(qualifier, []) or []:
-                cands.extend(pick_in_class(cls_full))
+        # 2) Qualified by a class-like name (including GeneXus lower-case class names)
+        if qualifier:
+            if qualifier in self._class_fulls_by_class_name or _looks_like_class_name(qualifier):
+                for cls_full in self._class_fulls_by_class_name.get(qualifier, []) or []:
+                    cands.extend(pick_in_class(cls_full))
 
         # 3) If still empty, try restricting to caller's referenced types
         if not cands:
@@ -497,7 +496,12 @@ class FunctionDesignRestorer:
                 if len(cands) >= 20:
                     break
 
-        # Deduplicate + cap
+        # If still empty and arg_count is known, relax arg_count filtering a bit to allow traversal.
+        # This is safe because downstream traversal is capped by call_max_nodes/depth.
+        if not cands and arg_count >= 0:
+            cands.extend((self._methods_by_name.get(name) or [])[:10])
+
+# Deduplicate + cap
         seen = set()
         uniq: List[str] = []
         for c in cands:
@@ -661,10 +665,7 @@ class FunctionDesignRestorer:
         
         # 機能グループ化
         grouped_functions = self._group_functions(functions)
-
-        # 2) 深度検索で関連機能を補完（同一テーブル/ER 隣接 + seed）
-        self._apply_deep_related(grouped_functions)
-
+        
         return SystemDesign(
             project_name=self.java_structure.get('project_root', 'Unknown'),
             functions=grouped_functions,
@@ -899,154 +900,6 @@ class FunctionDesignRestorer:
         
         return functions
     
-
-    def _apply_deep_related(self, functions: List[FunctionDesign]) -> None:
-        """深度検索で関連機能を推定して補完する。
-
-        既存の related_functions（callgraph/prefix の union）を seed としつつ、
-        追加で以下の信号を使い、BFS で depth=N まで探索して related_functions_deep を作る。
-
-        - 同一テーブル参照（人気テーブルは除外）
-        - ER 隣接テーブル参照（FK で 1-hop）
-        - seed 関係（callgraph/prefix）を優先
-
-        最終的に related_functions / related_classes へマージする。
-        """
-        if not getattr(self, "_enable_deep_related", True):
-            return
-
-        func_by_id: Dict[str, FunctionDesign] = {f.function_id: f for f in functions}
-
-        # table -> [function_id]
-        table_to_funcs: Dict[str, List[str]] = defaultdict(list)
-        table_popularity: Dict[str, int] = defaultdict(int)
-        for f in functions:
-            for t in (f.tables_used or []):
-                tn = str(t.get("table_name") or "").upper()
-                if not tn:
-                    continue
-                table_to_funcs[tn].append(f.function_id)
-                table_popularity[tn] += 1
-
-        # ER adjacency: TABLE -> neighbor TABLEs
-        er_adj: Dict[str, Set[str]] = defaultdict(set)
-        for fk in (self.db_metadata.get("foreign_keys", []) or []):
-            a = str(fk.get("from_table") or "").upper()
-            b = str(fk.get("to_table") or "").upper()
-            if a and b:
-                er_adj[a].add(b)
-                er_adj[b].add(a)
-
-        # Build function graph
-        popularity_th = int(getattr(self, "_deep_table_popularity_th", 200))
-        neighbor_cap = int(getattr(self, "_deep_table_neighbor_cap", 30))
-        tables_per_func = int(getattr(self, "_deep_tables_per_func", 3))
-        if tables_per_func < 1:
-            tables_per_func = 1
-
-        graph: Dict[str, Set[str]] = defaultdict(set)
-
-        # 0) Seed edges (callgraph/prefix union)
-        for f in functions:
-            sid = f.function_id
-            for rid in (getattr(f, "related_functions", []) or []):
-                if rid in func_by_id and rid != sid:
-                    graph[sid].add(rid)
-                    graph[rid].add(sid)
-
-        # 1) Edges by table co-usage + ER neighbor tables
-        for f in functions:
-            sid = f.function_id
-
-            # pick "main" tables (simple heuristic: more operations first)
-            scored: List[Tuple[int, str]] = []
-            for t in (f.tables_used or []):
-                tn = str(t.get("table_name") or "").upper()
-                if not tn:
-                    continue
-                ops = t.get("operations") or []
-                score = len(ops) if isinstance(ops, (list, tuple, set)) else 0
-                scored.append((score, tn))
-            scored.sort(reverse=True)
-            picked = [tn for _, tn in scored[:tables_per_func]]
-
-            for tn in picked:
-                if table_popularity.get(tn, 0) > popularity_th:
-                    continue
-
-                # Same-table peers
-                peers = table_to_funcs.get(tn, []) or []
-                for pid in peers[:neighbor_cap]:
-                    if pid != sid and pid in func_by_id:
-                        graph[sid].add(pid)
-                        graph[pid].add(sid)
-
-                # ER neighbor tables (1-hop)
-                for nb in list(er_adj.get(tn, set()))[:neighbor_cap]:
-                    if table_popularity.get(nb, 0) > popularity_th:
-                        continue
-                    n_peers = table_to_funcs.get(nb, []) or []
-                    for pid in n_peers[:neighbor_cap]:
-                        if pid != sid and pid in func_by_id:
-                            graph[sid].add(pid)
-                            graph[pid].add(sid)
-
-        # Freeze adjacency as sorted lists (stable + faster in BFS)
-        graph_list: Dict[str, List[str]] = {k: sorted(v) for k, v in graph.items()}
-
-        depth_limit = int(getattr(self, "_deep_related_depth", 2))
-        if depth_limit < 1:
-            depth_limit = 1
-        max_out = int(getattr(self, "_deep_related_max", 80))
-        if max_out < 0:
-            max_out = 0
-
-        if self._progress:
-            print(
-                f"[progress] Step3: deep-related search on {len(functions)} functions depth={depth_limit} max={max_out}",
-                file=sys.stderr,
-            )
-
-        for idx, f in enumerate(functions, start=1):
-            sid = f.function_id
-            deep = self._bfs_related(graph_list, sid, depth_limit, max_out)
-            f.related_functions_deep = deep
-
-            merged = sorted(set((f.related_functions or []) + deep))
-            f.related_functions = merged
-            f.related_classes = merged
-
-            if self._progress and (idx == 1 or idx % max(1, int(self._progress_every)) == 0):
-                print(
-                    f"[progress] deep ({idx}/{len(functions)}): {sid} +{len(deep)} (neighbors={len(graph_list.get(sid, []))})",
-                    file=sys.stderr,
-                )
-
-    def _bfs_related(self, graph_list: Dict[str, List[str]], start_id: str, depth_limit: int, max_out: int) -> List[str]:
-        """BFS over function graph up to depth_limit, returning up to max_out function_ids."""
-        if max_out <= 0:
-            return []
-
-        out: List[str] = []
-        visited: Set[str] = {start_id}
-        q: deque[Tuple[str, int]] = deque([(start_id, 0)])
-
-        while q and len(out) < max_out:
-            nid, depth = q.popleft()
-            if depth >= depth_limit:
-                continue
-            for nb in (graph_list.get(nid) or []):
-                if nb in visited:
-                    continue
-                visited.add(nb)
-                if nb != start_id:
-                    out.append(nb)
-                    if len(out) >= max_out:
-                        break
-                q.append((nb, depth + 1))
-
-        return out
-
     def _extract_prefix(self, class_name: str) -> str:
         """クラス名からプレフィックスを抽出"""
         if '_' in class_name:
@@ -1215,21 +1068,6 @@ def main():
     parser.add_argument("--debug-callgraph", action="store_true",
                         help="コールグラフ追跡の詳細ログを出力（重いので注意）")
 
-    # Deep-related (function relation expansion)
-    parser.add_argument("--no-deep-related", action="store_true",
-                        help="深度検索による関連機能推定を無効化する")
-    parser.add_argument("--deep-related-depth", type=int, default=2,
-                        help="深度検索の探索深さ (default: 2)")
-    parser.add_argument("--deep-related-max", type=int, default=80,
-                        help="深度検索で追加する関連機能の最大数 (default: 80)")
-    parser.add_argument("--deep-table-popularity-th", type=int, default=200,
-                        help="人気テーブル閾値（これ以上の機能が参照するテーブルはリンクに使わない） (default: 200)")
-    parser.add_argument("--deep-table-neighbor-cap", type=int, default=30,
-                        help="1テーブルあたり関連機能を拾う最大数 (default: 30)")
-    parser.add_argument("--deep-tables-per-func", type=int, default=3,
-                        help="1機能あたりリンクに使う主要テーブル数 (default: 3)")
-
-
     args = parser.parse_args()
     
     java_path = Path(args.java_structure)
@@ -1256,15 +1094,6 @@ def main():
     # Override traversal limits from CLI
     restorer._call_max_depth = max(0, int(args.call_depth))
     restorer._call_max_nodes = max(1, int(args.call_nodes))
-
-    # Deep-related config
-    restorer._enable_deep_related = not bool(args.no_deep_related)
-    restorer._deep_related_depth = max(1, int(args.deep_related_depth))
-    restorer._deep_related_max = max(0, int(args.deep_related_max))
-    restorer._deep_table_popularity_th = max(0, int(args.deep_table_popularity_th))
-    restorer._deep_table_neighbor_cap = max(1, int(args.deep_table_neighbor_cap))
-    restorer._deep_tables_per_func = max(1, int(args.deep_tables_per_func))
-
     design = restorer.restore_design()
     
     design_doc = format_design_document(design)
