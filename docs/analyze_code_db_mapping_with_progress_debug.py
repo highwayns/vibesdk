@@ -23,9 +23,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Any, Set, Tuple, Optional
 from dataclasses import dataclass, field, asdict
-from collections import defaultdict
-
-
+from collections import defaultdict, deque
 # ---------- 呼び出し関係（コールグラフ） ----------
 
 _IGNORE_METHOD_NAMES = {
@@ -460,6 +458,7 @@ class FunctionDesignRestorer:
         self._call_max_depth = int(java_structure.get('call_graph', {}).get('max_depth', 8)) if isinstance(java_structure, dict) else 8
         self._call_max_nodes = int(java_structure.get('call_graph', {}).get('max_nodes', 800)) if isinstance(java_structure, dict) else 800
         self._method_index, self._class_index = self._build_call_graph_indexes()
+        self._class_name_to_fulls, self._class_full_to_method_ids, self._methods_by_class, self._methods_by_name = self._build_fast_call_indexes()
         self._method_refs_cache: Dict[str, List[TableReference]] = {}
         self._method_columns_cache: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
 
@@ -526,125 +525,231 @@ class FunctionDesignRestorer:
         return info
 
     def _build_call_graph_indexes(self) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
-        """Build method/class indexes for call graph resolution.
+        """Build method/class indexes for call graph resolution (fast lookup friendly).
 
         Returns:
-          method_index: {
-            method_id: {
-              class_full, class_name, method_name, param_count, text, calls, class_type_refs
-            }
-          }
-          class_index: {
-            class_full: {
-              class_name, function_type, genexus_type, type_references
-            }
-          }
+          method_index: { method_id: {class_full, class_name, method_name, param_count, start_line, file, text, calls, sql_strings, has_db_hints, type_references} }
+          class_index:  { class_full: {class_name, class_full, file, function_type, genexus_type, type_references} }
         """
         method_index: Dict[str, Dict[str, Any]] = {}
         class_index: Dict[str, Dict[str, Any]] = {}
 
-        for file_entry in self.java_structure.get('files', []):
-            for cls in file_entry.get('classes', []):
-                class_name = cls.get('name', '')
-                class_full = cls.get('full_name') or (f"{cls.get('package')}.{class_name}" if cls.get('package') else class_name)
+        for file_entry in self.java_structure.get('files', []) or []:
+            file_path = (
+                file_entry.get('path')
+                or file_entry.get('file_path')
+                or file_entry.get('relative_path')
+                or file_entry.get('name')
+                or file_entry.get('file')
+                or ''
+            )
+
+            for cls in file_entry.get('classes', []) or []:
+                class_name = (cls.get('name') or '').strip()
+                package = (cls.get('package') or '').strip()
+                class_full = (cls.get('full_name') or '').strip() or (f"{package}.{class_name}" if package else class_name)
+
                 deps = cls.get('dependencies') or {}
                 type_refs = deps.get('type_references') or []
 
                 class_index[class_full] = {
                     'class_name': class_name,
                     'class_full': class_full,
+                    'file': file_path,
                     'function_type': cls.get('function_type', 'other'),
                     'genexus_type': cls.get('genexus_type'),
                     'type_references': list(type_refs),
                 }
 
-                for m in cls.get('methods', []) or []:
-                    mname = m.get('name') or ''
+                for m in (cls.get('methods', []) or []):
+                    mname = (m.get('name') or '').strip()
                     if not mname:
                         continue
+
                     param_count = m.get('param_count', -1)
+                    try:
+                        param_count_i = int(param_count) if param_count is not None else -1
+                    except Exception:
+                        param_count_i = -1
+
                     start_line = m.get('start_line', 0)
+                    try:
+                        start_line_i = int(start_line) if start_line is not None else 0
+                    except Exception:
+                        start_line_i = 0
 
                     # Build analysis text: excerpt/signature + extracted SQL literals
-                    text = (m.get('code') or '')
-                    if not text:
-                        text = (m.get('signature') or '')
+                    text2 = (m.get('code') or '')
+                    if not text2:
+                        text2 = (m.get('signature') or '')
                     sql_strings = m.get('sql_strings') or []
-                    if sql_strings:
-                        text = text + "\n" + "\n".join(sql_strings)
+                    if isinstance(sql_strings, list) and sql_strings:
+                        text2 = text2 + "\n" + "\n".join([str(s) for s in sql_strings])
 
-                    method_id = f"{class_full}::{mname}({param_count})@{start_line}"
+                    method_id = f"{class_full}::{mname}({param_count_i})@{start_line_i}"
                     method_index[method_id] = {
                         'method_id': method_id,
+                        'file': file_path,
                         'class_name': class_name,
                         'class_full': class_full,
                         'method_name': mname,
-                        'param_count': int(param_count) if param_count is not None else -1,
-                        'start_line': int(start_line) if start_line is not None else 0,
-                        'text': text,
-                        # Keep raw SQL strings for debug (do not rely on concatenated text)
+                        'param_count': param_count_i,
+                        'start_line': start_line_i,
+                        'text': text2,
                         'sql_strings': list(sql_strings) if isinstance(sql_strings, list) else [],
                         'signature': m.get('signature') or '',
                         'calls': m.get('calls') or [],
                         'type_references': list(type_refs),
+                        'has_db_hints': bool(m.get('has_db_hints', False)),
                     }
 
         return method_index, class_index
 
+    def _build_fast_call_indexes(self):
+        """Prebuild fast lookup indexes for call resolution.
+
+        This avoids scanning all methods for every single call, which was a major slowdown.
+        """
+        class_name_to_fulls: Dict[str, List[str]] = defaultdict(list)
+        class_full_to_method_ids: Dict[str, List[str]] = defaultdict(list)
+
+        # methods_by_class[class_full][method_name][param_count] -> [method_id, ...]
+        methods_by_class: Dict[str, Dict[str, Dict[int, List[str]]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+        # methods_by_name[method_name][param_count] -> [method_id, ...] (global fallback)
+        methods_by_name: Dict[str, Dict[int, List[str]]] = defaultdict(lambda: defaultdict(list))
+
+        # class name -> full names
+        for cls_full, cinfo in (self._class_index or {}).items():
+            cname = (cinfo.get('class_name') or '').strip()
+            if cname:
+                class_name_to_fulls[cname].append(cls_full)
+
+        # method indexes
+        for mid, rec in (self._method_index or {}).items():
+            cls_full = rec.get('class_full') or ''
+            mname = rec.get('method_name') or ''
+            try:
+                pc = int(rec.get('param_count', -1))
+            except Exception:
+                pc = -1
+
+            if cls_full:
+                class_full_to_method_ids[cls_full].append(mid)
+            if mname:
+                methods_by_class[cls_full][mname][pc].append(mid)
+                methods_by_name[mname][pc].append(mid)
+
+        # De-duplicate lists while preserving order (important for stable output)
+        def dedup_list(xs: List[str]) -> List[str]:
+            seen = set()
+            out = []
+            for x in xs:
+                if x in seen:
+                    continue
+                seen.add(x)
+                out.append(x)
+            return out
+
+        for k in list(class_name_to_fulls.keys()):
+            class_name_to_fulls[k] = dedup_list(class_name_to_fulls[k])
+        for k in list(class_full_to_method_ids.keys()):
+            class_full_to_method_ids[k] = dedup_list(class_full_to_method_ids[k])
+
+        # deep structures: de-dup leaf lists
+        for cf, m_map in list(methods_by_class.items()):
+            for mn, pc_map in list(m_map.items()):
+                for pc, mids in list(pc_map.items()):
+                    pc_map[pc] = dedup_list(mids)
+        for mn, pc_map in list(methods_by_name.items()):
+            for pc, mids in list(pc_map.items()):
+                pc_map[pc] = dedup_list(mids)
+
+        return class_name_to_fulls, class_full_to_method_ids, methods_by_class, methods_by_name
+
     def _resolve_call_candidates(self, caller_class_full: str, call: Dict[str, Any]) -> List[str]:
-        """Resolve a call dict to candidate method_id list (best-effort)."""
+        """Resolve a call dict to candidate method_id list.
+
+        IMPORTANT: In java_structure.json (as confirmed by your sample),
+          - call["qualifier"] is the *callee class name* (or an expression like "new Xxx()")
+          - call["name"] is the *callee method name*
+        This implementation prioritizes qualifier->class resolution and uses prebuilt indexes.
+        """
         name = (call.get('name') or '').strip()
         if not name or name in _IGNORE_METHOD_NAMES:
             return []
+
         try:
             arg_count = int(call.get('arg_count', -1))
         except Exception:
             arg_count = -1
-        qualifier = _simplify_qualifier(call.get('qualifier'))
 
-        # Helper to pick methods in a class
-        def pick_in_class(class_full: str) -> List[str]:
+        qualifier_raw = call.get('qualifier')
+        qualifier = _simplify_qualifier(qualifier_raw)  # may return None
+
+        # Fast helper: get methods in a given class_full for (name, arg_count)
+        def methods_in_class(class_full: str) -> List[str]:
             out: List[str] = []
-            for mid, rec in self._method_index.items():
-                if rec.get('class_full') != class_full:
-                    continue
-                if rec.get('method_name') != name:
-                    continue
-                if arg_count >= 0 and rec.get('param_count') not in (arg_count, -1):
-                    continue
-                out.append(mid)
+            m_map = (self._methods_by_class.get(class_full) or {}).get(name)
+            if not m_map:
+                return out
+
+            if arg_count >= 0:
+                out.extend(m_map.get(arg_count, []))
+                # allow unknown param_count(-1) as compatible
+                out.extend(m_map.get(-1, []))
+            else:
+                # unknown arg_count: take all overloads
+                for mids in m_map.values():
+                    out.extend(mids)
+            return out
+
+        def methods_in_class_fulls(class_fulls: List[str], cap: int = 40) -> List[str]:
+            seen = set()
+            out: List[str] = []
+            for cf in class_fulls:
+                for mid in methods_in_class(cf):
+                    if mid in seen:
+                        continue
+                    seen.add(mid)
+                    out.append(mid)
+                    if len(out) >= cap:
+                        return out
             return out
 
         cands: List[str] = []
 
-        # 1) unqualified / this / super: same class first
-        if not qualifier or qualifier in ('this', 'super'):
-            cands.extend(pick_in_class(caller_class_full))
+        # 1) this/super/unqualified => same class first
+        if (not qualifier) or qualifier in ('this', 'super'):
+            cands.extend(methods_in_class_fulls([caller_class_full], cap=40))
 
-        # 2) Qualified by a class-like name (static call)
-        if qualifier and _looks_like_class_name(qualifier):
-            for cls_full, cls_info in self._class_index.items():
-                if cls_info.get('class_name') == qualifier:
-                    cands.extend(pick_in_class(cls_full))
+        # 2) qualifier resolves to an existing class name (do NOT require uppercase)
+        if qualifier and qualifier not in ('this', 'super'):
+            fulls = self._class_name_to_fulls.get(qualifier, [])
+            if fulls:
+                cands.extend(methods_in_class_fulls(fulls, cap=60))
 
-        # 3) If still empty, try restricting to caller's referenced types
+        # 3) If still empty, use caller's referenced types as a constraint
         if not cands:
-            type_refs = set((self._class_index.get(caller_class_full) or {}).get('type_references') or [])
-            if type_refs:
-                for cls_full, cls_info in self._class_index.items():
-                    if cls_info.get('class_name') in type_refs:
-                        cands.extend(pick_in_class(cls_full))
-
-        # 4) Global fallback (cap)
-        if not cands:
-            for mid, rec in self._method_index.items():
-                if rec.get('method_name') != name:
+            type_refs = (self._class_index.get(caller_class_full) or {}).get('type_references') or []
+            for t in type_refs:
+                fulls = self._class_name_to_fulls.get(str(t), [])
+                if not fulls:
                     continue
-                if arg_count >= 0 and rec.get('param_count') not in (arg_count, -1):
-                    continue
-                cands.append(mid)
-                if len(cands) >= 20:
+                cands.extend(methods_in_class_fulls(fulls, cap=60))
+                if cands:
                     break
+
+        # 4) Global fallback by method name (cap hard to prevent explosion)
+        if not cands:
+            pc_map = self._methods_by_name.get(name) or {}
+            out: List[str] = []
+            if arg_count >= 0:
+                out.extend(pc_map.get(arg_count, []))
+                out.extend(pc_map.get(-1, []))
+            else:
+                for mids in pc_map.values():
+                    out.extend(mids)
+            cands = out[:20]
 
         # Deduplicate
         seen = set()
@@ -659,7 +764,6 @@ class FunctionDesignRestorer:
         """Collect table references by traversing the call graph starting from a class' methods.
 
         Returns: (refs, columns_used_map, related_classes, debug_info)
-        columns_used_map: {TABLE: [ {name, logical_name}, ... ]}
         """
         class_name = cls_data.get('name', '')
         class_full = cls_data.get('full_name') or (f"{cls_data.get('package')}.{class_name}" if cls_data.get('package') else class_name)
@@ -684,15 +788,11 @@ class FunctionDesignRestorer:
             'max_depth_seen': 0,
         }
 
-        # Entry method candidates: all declared methods in this class
-        entry_method_ids: List[str] = []
-        for mid, rec in self._method_index.items():
-            if rec.get('class_full') == class_full:
-                entry_method_ids.append(mid)
-
+        # Entry methods: use prebuilt mapping (fast), avoid scanning all methods.
+        entry_method_ids: List[str] = list(self._class_full_to_method_ids.get(class_full, []))
         debug_info['entry_method_count'] = len(entry_method_ids)
 
-        # No method index (older json) -> fallback to in-class extraction only
+        # If no method index (older json) -> fallback to in-class extraction only
         if not entry_method_ids:
             all_references: List[TableReference] = []
             columns_used_map: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -711,64 +811,45 @@ class FunctionDesignRestorer:
                     cols_used = _extract_used_columns(method_code, cols)
                     if cols_used:
                         columns_used_map[r.table_name.upper()] = cols_used
-            # Best-effort debug info for fallback mode
-            if getattr(self, '_debug_enabled', False):
-                for m in cls_data.get('methods', []) or []:
-                    method_code = (m.get('code') or '')
-                    if not method_code:
-                        method_code = (m.get('signature') or '')
-                    sqls = m.get('sql_strings') or []
-                    if sqls:
-                        method_code = method_code + "\n" + "\n".join(sqls)
-
-                    candidates = self.extractor.debug_scan_sql_candidates(method_code)
-                    hints = self.extractor.debug_scan_db_hints(method_code)
-                    if m.get('has_db_hints') and not any(h.get('hint_type') == 'FLAG:has_db_hints' for h in hints):
-                        hints = ([{'hint_type': 'FLAG:has_db_hints', 'match': ''}] + hints)[:12]
-                    for h in hints:
-                        ht = (h.get('hint_type') or 'UNKNOWN')
-                        debug_info['db_hints_counter'][ht] += 1
-                        if len(debug_info['db_hints_samples']) < 30:
-                            debug_info['db_hints_samples'].append(self._shorten(f"{ht}:{h.get('match')}", 120))
-
-                    has_any_sql_signal = bool(sqls) or bool(candidates) or bool(hints)
-                    if has_any_sql_signal and len(debug_info['direct_sql_methods']) < self._debug_max_methods_with_sql_per_class:
-                        debug_info['direct_sql_methods'].append({
-                            'class_full': class_full,
-                            'class_name': class_name,
-                            'method': m.get('name'),
-                            'method_id': f"{class_full}::{m.get('name')}(-1)@{m.get('start_line',0)}",
-                            'depth': 0,
-                            'sql_strings': [self._shorten(s, self._debug_sql_preview_len) for s in (sqls[: self._debug_max_sql_snippets_per_method])],
-                            'db_hints': hints[:12],
-                            'sql_candidates': [c for c in candidates if c.get('is_valid')][:15],
-                            'sql_candidates_ignored': [c for c in candidates if not c.get('is_valid')][:15],
-                            'note': 'fallback_mode_no_callgraph_index'
-                        })
             return all_references, columns_used_map, set(), debug_info
 
-        # Call graph traversal
+        # Heuristic: start from "interesting" entry methods to avoid exploding the traversal.
+        def is_interesting(mid: str) -> bool:
+            rec = self._method_index.get(mid) or {}
+            if rec.get('calls'):
+                return True
+            if rec.get('sql_strings'):
+                return True
+            if rec.get('has_db_hints'):
+                return True
+            return False
+
+        filtered_entry = [mid for mid in entry_method_ids if is_interesting(mid)]
+        if filtered_entry:
+            entry_method_ids = filtered_entry
+
+        # Call graph traversal (deque + enqueued de-dup for performance)
         visited: Set[str] = set()
-        queue: List[Tuple[str, int]] = [(mid, 0) for mid in entry_method_ids]
+        enqueued: Set[str] = set(entry_method_ids)
+        queue: deque = deque([(mid, 0) for mid in entry_method_ids])
+
         all_refs: List[TableReference] = []
         columns_used_map: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         related_classes: Set[str] = set()
 
-        # per-class call-graph progress
         cg_start_ts = time.monotonic()
         refs_total = 0
         cache_hits = 0
         unique_tables: Set[str] = set()
 
         while queue and len(visited) < self._call_max_nodes:
-            mid, depth = queue.pop(0)
+            mid, depth = queue.popleft()
             if mid in visited:
                 continue
             visited.add(mid)
             if depth > debug_info.get('max_depth_seen', 0):
                 debug_info['max_depth_seen'] = depth
 
-            # Stats
             self._stats['methods_visited'] = self._stats.get('methods_visited', 0) + 1
 
             rec = self._method_index.get(mid) or {}
@@ -789,7 +870,6 @@ class FunctionDesignRestorer:
                     if len(debug_info['db_hints_samples']) < 30:
                         debug_info['db_hints_samples'].append(self._shorten(f"{ht}:{h.get('match')}", 120))
 
-                # Record ignored candidates (not in db_metadata)
                 for c in candidates:
                     if not c.get('is_valid') and c.get('normalized'):
                         debug_info['ignored_sql_candidates'][str(c.get('normalized')).upper()] += 1
@@ -805,7 +885,7 @@ class FunctionDesignRestorer:
                         'method_id': mid,
                         'depth': depth,
                         'sql_strings': [self._shorten(s, self._debug_sql_preview_len) for s in (sql_strings[: self._debug_max_sql_snippets_per_method])],
-                                                'db_hints': hints[:12],
+                        'db_hints': hints[:12],
                         'sql_candidates': [c for c in candidates if c.get('is_valid')][:15],
                         'sql_candidates_ignored': [c for c in candidates if not c.get('is_valid')][:15],
                     }
@@ -825,7 +905,6 @@ class FunctionDesignRestorer:
             else:
                 refs = self.extractor.extract_from_code(text, src_class, src_method)
                 cols_map: Dict[str, List[Dict[str, Any]]] = {}
-                # columns used (heuristic) per table
                 for r in refs:
                     tinfo = self.table_info.get(r.table_name.upper(), {})
                     cols = tinfo.get('columns', [])
@@ -834,22 +913,23 @@ class FunctionDesignRestorer:
                         cols_map[r.table_name.upper()] = cols_used
                 self._method_refs_cache[mid] = refs
                 self._method_columns_cache[mid] = cols_map
+
             all_refs.extend(refs)
             refs_total += len(refs)
             self._stats['table_refs'] = self._stats.get('table_refs', 0) + len(refs)
+
             for r in refs:
                 tn = (r.table_name or '').upper()
                 if tn:
                     unique_tables.add(tn)
                     self._stats_unique_tables.add(tn)
 
-            # Periodic call-graph progress
             if self._progress_call_every > 0 and len(visited) % self._progress_call_every == 0:
                 self._progress(
                     f"[進捗] callgraph {class_name}: visited={len(visited)}/{self._call_max_nodes} queue={len(queue)} depth={depth}/{self._call_max_depth} refs={refs_total} unique_tables={len(unique_tables)} cache_hits={cache_hits} elapsed={self._fmt_elapsed(cg_start_ts)}"
                 )
+
             for t, cols in (cols_map or {}).items():
-                # merge unique column dicts by name
                 existing = {c.get('name') for c in columns_used_map.get(t, [])}
                 for c in cols:
                     if c.get('name') not in existing:
@@ -858,28 +938,37 @@ class FunctionDesignRestorer:
 
             # Follow calls
             if depth >= self._call_max_depth:
-                # We reached depth limit; if there are still calls here, record that.
                 calls_here = rec.get('calls') or []
                 if calls_here:
                     debug_info['skipped_calls_by_depth'] += len(calls_here)
                 continue
+
+            caller_cf = rec.get('class_full') or class_full
             for call in rec.get('calls') or []:
-                cands = self._resolve_call_candidates(rec.get('class_full') or class_full, call)
+                cands = self._resolve_call_candidates(caller_cf, call)
                 if not cands:
                     debug_info['unresolved_calls'] += 1
                     if getattr(self, '_debug_enabled', False) and len(debug_info['call_samples']) < self._debug_max_call_samples:
                         debug_info['call_samples'].append({
                             'kind': 'unresolved',
                             'depth': depth,
-                            'caller': mid,
-                            'call': {
-                                'name': call.get('name'),
-                                'qualifier': call.get('qualifier'),
-                                'arg_count': call.get('arg_count'),
-                            },
-                            'resolved_count': 0,
+                            'caller': {
+                            'method_id': mid,
+                            'file': rec.get('file'),
+                            'class_full': rec.get('class_full') or class_full,
+                            'class_name': rec.get('class_name') or src_class,
+                            'method': src_method,
+                        },
+                        'call': {
+                            'name': call.get('name'),
+                            'qualifier': call.get('qualifier'),
+                            'arg_count': call.get('arg_count'),
+                        },
+                        'resolved_count': 0,
                         })
-                elif len(cands) > 1:
+                    continue
+
+                if len(cands) > 1:
                     debug_info['ambiguous_calls'] += 1
                     if getattr(self, '_debug_enabled', False) and len(debug_info['call_samples']) < self._debug_max_call_samples:
                         debug_info['call_samples'].append({
@@ -892,22 +981,40 @@ class FunctionDesignRestorer:
                                 'arg_count': call.get('arg_count'),
                             },
                             'resolved_count': len(cands),
-                            'resolved_sample': cands[:5],
+                            'resolved_sample': [
+                            {
+                                'method_id': x,
+                                'file': (self._method_index.get(x) or {}).get('file'),
+                                'class_full': (self._method_index.get(x) or {}).get('class_full'),
+                                'class_name': (self._method_index.get(x) or {}).get('class_name'),
+                                'method': (self._method_index.get(x) or {}).get('method_name'),
+                            }
+                            for x in cands[:5]
+                        ],
                         })
-                for cmid in cands:
-                    if cmid not in visited:
-                        queue.append((cmid, depth + 1))
-                        callee_cls_full = (self._method_index.get(cmid) or {}).get('class_full')
-                        if callee_cls_full and callee_cls_full != class_full:
-                            related_classes.add((self._class_index.get(callee_cls_full) or {}).get('class_name', callee_cls_full))
 
-        # If we stopped due to node limit, record it.
+                for cmid in cands:
+                    if cmid in visited or cmid in enqueued:
+                        continue
+
+                    # Skip "boring leaf" methods: no calls/hints/sql. (performance)
+                    crec = self._method_index.get(cmid) or {}
+                    if not (crec.get('calls') or crec.get('sql_strings') or crec.get('has_db_hints')):
+                        continue
+
+                    enqueued.add(cmid)
+                    queue.append((cmid, depth + 1))
+
+                    callee_cls_full = crec.get('class_full')
+                    if callee_cls_full and callee_cls_full != class_full:
+                        related_classes.add((self._class_index.get(callee_cls_full) or {}).get('class_name', callee_cls_full))
+
         if queue and len(visited) >= self._call_max_nodes:
             debug_info['truncated_by_nodes'] = True
             debug_info['queue_remaining_when_truncated'] = len(queue)
 
         debug_info['visited_methods'] = len(visited)
-        # make serializable / printable
+
         if isinstance(debug_info.get('ignored_sql_candidates'), defaultdict):
             debug_info['ignored_sql_candidates'] = dict(debug_info['ignored_sql_candidates'])
         if isinstance(debug_info.get('db_hints_counter'), defaultdict):
