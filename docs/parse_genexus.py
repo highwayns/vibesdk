@@ -671,7 +671,9 @@ def extract_from_file(path: Path, parser: Parser, method_filter: str = 'calls_or
             if method_filter == 'all':
                 keep_method = True
             elif method_filter == 'calls_or_sql':
-                keep_method = (len(calls) > 0) or (len(sql_strings) > 0)
+                # Add has_db_hints judgment while scanning (cursor/BC ops etc.)
+                has_line_hints = bool(_DB_HINT_LINE_RE.search(method_text))
+                keep_method = (len(calls) > 0) or (len(sql_strings) > 0) or has_line_hints
             elif method_filter == 'calls_or_sql_or_hints':
                 # DB hint: cursor / BC load/save/delete / SQL keywords in text lines
                 has_line_hints = bool(_DB_HINT_LINE_RE.search(method_text))

@@ -192,6 +192,22 @@ class TableReferenceExtractor:
         # SDT参照
         'SDT_REF': r'(?i)sdt_(\w+)',
     }
+
+    # DB access "hints" (heuristics) - used for debug / filtering / prioritization.
+    # These patterns intentionally over-approximate: they are meant to explain
+    # "this method likely touches DB" even if we can't map it to a physical table.
+    DB_HINT_PATTERNS = {
+        # GeneXus BC / helper access (even when table cannot be inferred)
+        'GX_BC_CALL': r'(?i)\b\w+_bc\s*\.\s*(load|save|insert|update|delete)\b',
+        'GX_PR_DEFAULT': r'(?i)\bpr_default\b',
+        'GX_CURSOR': r'(?i)\b(cursor|open\s*\(|close\s*\(|fetch\s*\()\b',
+        'GX_DATASTORE': r'(?i)\b(DataStoreProvider|IDataStoreProvider|DataStoreHelper|GxDataStore|GxContext)\b',
+        'GX_EXECUTE': r'(?i)\b(execute\s*\(|executeStmt|executeDirectSQL|executeQuery|executeUpdate)\b',
+        # JDBC-ish
+        'JDBC': r'(?i)\b(prepareStatement|createStatement|PreparedStatement|CallableStatement|ResultSet)\b',
+        # Generic SQL keywords (fallback; may be noisy but useful when literals are concatenated)
+        'SQL_KEYWORD': r'(?i)\b(select|insert\s+into|update|delete\s+from)\b',
+    }
     
     def __init__(self, db_metadata: Dict[str, Any]):
         self.db_metadata = db_metadata
@@ -352,6 +368,52 @@ class TableReferenceExtractor:
                         out.append({'op_type': op_type, 'raw_token': f"{match.group(1)}.{raw}", 'normalized': norm, 'is_valid': True, 'reason': 'ok'})
                     else:
                         out.append({'op_type': op_type, 'raw_token': f"{match.group(1)}.{raw}", 'normalized': norm, 'is_valid': False, 'reason': 'not_in_db_metadata'})
+        return out
+
+    def has_db_hints(self, code: str) -> bool:
+        """Return True if the code contains DB-access hints.
+
+        This is intentionally heuristic and may over-approximate.
+        It is used to:
+          - keep methods during parsing/filtering
+          - explain 'why DB likely exists but tables were not extracted'
+        """
+        if not code:
+            return False
+        # Fast path: check GeneXus patterns too
+        for _, pat in self.GENEXUS_PATTERNS.items():
+            if re.search(pat, code):
+                return True
+        for _, pat in self.DB_HINT_PATTERNS.items():
+            if re.search(pat, code):
+                return True
+        return False
+
+    def debug_scan_db_hints(self, code: str, max_items: int = 12) -> List[Dict[str, Any]]:
+        """Debug helper: scan DB hint patterns and report hits."""
+        out: List[Dict[str, Any]] = []
+        if not code:
+            return out
+
+        # 1) GeneXus patterns
+        for name, pat in self.GENEXUS_PATTERNS.items():
+            for m in re.finditer(pat, code):
+                out.append({
+                    'hint_type': f"GENEXUS:{name}",
+                    'match': (m.group(0) or '')[:120],
+                })
+                if len(out) >= max_items:
+                    return out
+
+        # 2) Generic DB hint patterns
+        for name, pat in self.DB_HINT_PATTERNS.items():
+            for m in re.finditer(pat, code):
+                out.append({
+                    'hint_type': name,
+                    'match': (m.group(0) or '')[:120],
+                })
+                if len(out) >= max_items:
+                    return out
         return out
     
     def _get_logical_name(self, table_name: str) -> str:
@@ -609,6 +671,8 @@ class FunctionDesignRestorer:
             'visited_methods': 0,
             'direct_sql_methods': [],
             'indirect_sql_methods': [],
+            'db_hints_counter': defaultdict(int),
+            'db_hints_samples': [],
             'ignored_sql_candidates': defaultdict(int),
             'ignored_sql_tokens_sample': [],
             'unresolved_calls': 0,
@@ -650,12 +714,35 @@ class FunctionDesignRestorer:
             # Best-effort debug info for fallback mode
             if getattr(self, '_debug_enabled', False):
                 for m in cls_data.get('methods', []) or []:
+                    method_code = (m.get('code') or '')
+                    if not method_code:
+                        method_code = (m.get('signature') or '')
                     sqls = m.get('sql_strings') or []
                     if sqls:
+                        method_code = method_code + "\n" + "\n".join(sqls)
+
+                    candidates = self.extractor.debug_scan_sql_candidates(method_code)
+                    hints = self.extractor.debug_scan_db_hints(method_code)
+                    if m.get('has_db_hints') and not any(h.get('hint_type') == 'FLAG:has_db_hints' for h in hints):
+                        hints = ([{'hint_type': 'FLAG:has_db_hints', 'match': ''}] + hints)[:12]
+                    for h in hints:
+                        ht = (h.get('hint_type') or 'UNKNOWN')
+                        debug_info['db_hints_counter'][ht] += 1
+                        if len(debug_info['db_hints_samples']) < 30:
+                            debug_info['db_hints_samples'].append(self._shorten(f"{ht}:{h.get('match')}", 120))
+
+                    has_any_sql_signal = bool(sqls) or bool(candidates) or bool(hints)
+                    if has_any_sql_signal and len(debug_info['direct_sql_methods']) < self._debug_max_methods_with_sql_per_class:
                         debug_info['direct_sql_methods'].append({
                             'class_full': class_full,
+                            'class_name': class_name,
                             'method': m.get('name'),
+                            'method_id': f"{class_full}::{m.get('name')}(-1)@{m.get('start_line',0)}",
+                            'depth': 0,
                             'sql_strings': [self._shorten(s, self._debug_sql_preview_len) for s in (sqls[: self._debug_max_sql_snippets_per_method])],
+                            'db_hints': hints[:12],
+                            'sql_candidates': [c for c in candidates if c.get('is_valid')][:15],
+                            'sql_candidates_ignored': [c for c in candidates if not c.get('is_valid')][:15],
                             'note': 'fallback_mode_no_callgraph_index'
                         })
             return all_references, columns_used_map, set(), debug_info
@@ -693,6 +780,15 @@ class FunctionDesignRestorer:
             if getattr(self, '_debug_enabled', False):
                 sql_strings = rec.get('sql_strings') or []
                 candidates = self.extractor.debug_scan_sql_candidates(text)
+                hints = self.extractor.debug_scan_db_hints(text)
+                if rec.get('has_db_hints') and not any(h.get('hint_type') == 'FLAG:has_db_hints' for h in hints):
+                    hints = ([{'hint_type': 'FLAG:has_db_hints', 'match': ''}] + hints)[:12]
+                for h in hints:
+                    ht = (h.get('hint_type') or 'UNKNOWN')
+                    debug_info['db_hints_counter'][ht] += 1
+                    if len(debug_info['db_hints_samples']) < 30:
+                        debug_info['db_hints_samples'].append(self._shorten(f"{ht}:{h.get('match')}", 120))
+
                 # Record ignored candidates (not in db_metadata)
                 for c in candidates:
                     if not c.get('is_valid') and c.get('normalized'):
@@ -700,7 +796,7 @@ class FunctionDesignRestorer:
                         if len(debug_info['ignored_sql_tokens_sample']) < 30:
                             debug_info['ignored_sql_tokens_sample'].append(self._shorten(str(c.get('raw_token')), 80))
 
-                has_any_sql_signal = bool(sql_strings) or bool(candidates)
+                has_any_sql_signal = bool(sql_strings) or bool(candidates) or bool(hints)
                 if has_any_sql_signal:
                     item = {
                         'class_full': rec.get('class_full') or class_full,
@@ -709,6 +805,7 @@ class FunctionDesignRestorer:
                         'method_id': mid,
                         'depth': depth,
                         'sql_strings': [self._shorten(s, self._debug_sql_preview_len) for s in (sql_strings[: self._debug_max_sql_snippets_per_method])],
+                                                'db_hints': hints[:12],
                         'sql_candidates': [c for c in candidates if c.get('is_valid')][:15],
                         'sql_candidates_ignored': [c for c in candidates if not c.get('is_valid')][:15],
                     }
@@ -813,6 +910,8 @@ class FunctionDesignRestorer:
         # make serializable / printable
         if isinstance(debug_info.get('ignored_sql_candidates'), defaultdict):
             debug_info['ignored_sql_candidates'] = dict(debug_info['ignored_sql_candidates'])
+        if isinstance(debug_info.get('db_hints_counter'), defaultdict):
+            debug_info['db_hints_counter'] = dict(debug_info['db_hints_counter'])
 
         self._progress(
             f"[進捗] callgraph done {class_name}: visited={len(visited)} refs={refs_total} unique_tables={len(unique_tables)} related_classes={len(related_classes)} cache_hits={cache_hits} elapsed={self._fmt_elapsed(cg_start_ts)}",
@@ -906,6 +1005,15 @@ class FunctionDesignRestorer:
         skipped_depth = int(debug_info.get('skipped_calls_by_depth') or 0)
         self._debug(f"[DEBUG] traversal_limits: truncated_by_nodes={trunc_nodes} queue_remaining={debug_info.get('queue_remaining_when_truncated')} skipped_calls_by_depth={skipped_depth}")
 
+        # DB hint summary (methods that look like DB access even if tables were not extracted)
+        hints_counter = debug_info.get('db_hints_counter') or {}
+        if hints_counter:
+            top_hints = sorted(hints_counter.items(), key=lambda kv: kv[1], reverse=True)[:20]
+            self._debug("[DEBUG] db_hints_top: " + ", ".join([f"{k}={v}" for k, v in top_hints]))
+            samples = debug_info.get('db_hints_samples') or []
+            if samples:
+                self._debug("[DEBUG] db_hints_samples: " + "; ".join(samples[:10]))
+
         # Candidates ignored due to db_metadata mismatch
         ignored = debug_info.get('ignored_sql_candidates') or {}
         if ignored:
@@ -932,6 +1040,9 @@ class FunctionDesignRestorer:
                 if sqls:
                     for s in sqls[: self._debug_max_sql_snippets_per_method]:
                         self._debug(f"      SQL: {self._shorten(s, self._debug_sql_preview_len)}")
+                hints = it.get('db_hints') or []
+                if hints:
+                    self._debug("      db_hints: " + ", ".join([str(h.get('hint_type')) for h in hints[:12]]))
                 c_ok = it.get('sql_candidates') or []
                 c_ng = it.get('sql_candidates_ignored') or []
                 if c_ok:
