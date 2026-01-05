@@ -1,0 +1,645 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+GeneXus Traceability Builder
+- Stage 1: Parse design exports (WP/WWP/SD/SDT/Proc/Trn/DP/REST...) -> infer feature names -> Feature_Design/Feature_Group tables
+- Stage 2: Scan generated Java sources -> map design object -> java files -> Design_Java table
+Output: Excel (.xlsx) with 3 sheets
+"""
+
+import argparse
+import json
+import re
+import sys
+import zipfile
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment
+from openpyxl.utils import get_column_letter
+
+
+def read_text_safely(path: Path, max_bytes: int = 2_000_000) -> str:
+    """Read text with encoding fallbacks; cap size to avoid huge files."""
+    data = path.read_bytes()[:max_bytes]
+    for enc in ("utf-8", "utf-8-sig", "cp932", "shift_jis", "gbk", "latin-1"):
+        try:
+            return data.decode(enc)
+        except Exception:
+            continue
+    return data.decode("utf-8", errors="ignore")
+
+
+def is_probable_name(s: str) -> bool:
+    if not s:
+        return False
+    s = s.strip()
+    if len(s) > 80:
+        return False
+    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", s))
+
+
+def normalize_key(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+
+def camel_tokens(name: str) -> List[str]:
+    parts = re.findall(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[0-9]+", name)
+    return [p.lower() for p in parts if p]
+
+
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+@dataclass
+class DesignObject:
+    object_name: str
+    object_type: str
+    source_file: str
+    title: str = ""
+    description: str = ""
+    raw_hints: str = ""
+    inferred_entity: str = ""
+    inferred_actions: str = ""
+    feature_names: str = ""
+
+
+TYPE_KEYWORDS = {
+    "WP": ["web panel", "webpanel", "wp"],
+    "WWP": ["workwith", "work with", "workwithplus", "wwp", "ww "],
+    "SD": ["smart device", "sd panel", "sdpanel", "mobile panel"],
+    "SDT": ["structured data type", "sdt"],
+    "Transaction": ["transaction", "trn"],
+    "Procedure": ["procedure", "proc"],
+    "DP": ["data provider", "dataprovider", "dp"],
+    "REST": ["rest", "web service", "webservice", "expose as web service"],
+    "API": ["api object", "apiobject"],
+    "Theme": ["theme"],
+}
+
+ACTION_PATTERNS = [
+    (re.compile(r"\b(search|filter|query|find)\b", re.I), "検索"),
+    (re.compile(r"\b(list|grid|browse)\b", re.I), "一覧"),
+    (re.compile(r"\b(view|detail|show)\b", re.I), "詳細"),
+    (re.compile(r"\b(new|create|insert|add)\b", re.I), "新規"),
+    (re.compile(r"\b(update|edit|modify)\b", re.I), "更新"),
+    (re.compile(r"\b(delete|remove)\b", re.I), "削除"),
+    (re.compile(r"\b(export|download)\b", re.I), "エクスポート"),
+    (re.compile(r"\b(import|upload)\b", re.I), "インポート"),
+    (re.compile(r"\b(approve|approval)\b", re.I), "承認"),
+    (re.compile(r"\b(login|signin|auth|authenticate)\b", re.I), "ログイン"),
+    (re.compile(r"\b(sync|synchronize)\b", re.I), "同期"),
+    (re.compile(r"\b(report|print)\b", re.I), "レポート"),
+]
+
+WWP_NAME_RULES = [
+    (re.compile(r"(WW|WorkWith)$", re.I), "管理/一覧検索"),
+    (re.compile(r"(View|Detail)$", re.I), "詳細表示"),
+    (re.compile(r"(Prompt|Select|Picker)$", re.I), "選択/検索"),
+    (re.compile(r"(Insert|Create|New)$", re.I), "新規"),
+    (re.compile(r"(Update|Edit)$", re.I), "更新"),
+    (re.compile(r"(Delete|Remove)$", re.I), "削除"),
+]
+
+
+def guess_type_from_text(text: str, filename: str) -> str:
+    t = (text[:20000] + "\n" + filename).lower()
+    best = ("Unknown", 0)
+    for k, kws in TYPE_KEYWORDS.items():
+        score = 0
+        for kw in kws:
+            if kw in t:
+                score += 1
+        if score > best[1]:
+            best = (k, score)
+    return best[0] if best[1] > 0 else "Unknown"
+
+
+def extract_name_type_title_from_xml(xml_text: str) -> Tuple[Optional[str], Optional[str], str, str, str]:
+    def pick_first(patterns: List[str]) -> Optional[str]:
+        for pat in patterns:
+            m = re.search(pat, xml_text, flags=re.I | re.S)
+            if m:
+                val = re.sub(r"\s+", " ", m.group(1)).strip()
+                if val:
+                    return val
+        return None
+
+    name = pick_first([
+        r"<\s*(?:ObjectName|ObjName|Name)\s*>\s*([^<\s][^<]{0,120}?)\s*</\s*(?:ObjectName|ObjName|Name)\s*>",
+        r'"\s*(?:ObjectName|ObjName|Name)\s*"\s*:\s*"\s*([^"]+?)\s*"',
+    ])
+    if name and not is_probable_name(name):
+        candidates = re.findall(r"<\s*Name\s*>\s*([A-Za-z_][A-Za-z0-9_]{1,60})\s*</\s*Name\s*>", xml_text)
+        name = next((c for c in candidates if is_probable_name(c)), None)
+
+    otype = pick_first([
+        r"<\s*(?:ObjectType|Type|Category|Class)\s*>\s*([^<]{1,80}?)\s*</\s*(?:ObjectType|Type|Category|Class)\s*>",
+        r'"\s*(?:ObjectType|Type|Category|Class)\s*"\s*:\s*"\s*([^"]+?)\s*"',
+    ])
+
+    title = pick_first([
+        r"<\s*(?:Title|Caption|FormCaption|Text)\s*>\s*([^<]{1,200}?)\s*</\s*(?:Title|Caption|FormCaption|Text)\s*>"
+    ]) or ""
+    desc = pick_first([
+        r"<\s*(?:Description|Desc|Documentation|Comment)\s*>\s*([^<]{1,400}?)\s*</\s*(?:Description|Desc|Documentation|Comment)\s*>"
+    ]) or ""
+
+    keywords = re.findall(r"\b(Search|Filter|Grid|For\s+each|Link|Call|Export|Import|Approve|Login|Sync|REST|SDT|DataProvider)\b",
+                          xml_text, flags=re.I)
+    hints = ",".join(sorted(set(k.lower() for k in keywords)))[:300] if keywords else ""
+    return name, otype, title, desc, hints
+
+
+def extract_name_type_title_from_text(text: str) -> Tuple[Optional[str], Optional[str], str, str, str]:
+    name = None
+    m = re.search(r"^\s*(?:Object|Name)\s*[:=]\s*([A-Za-z_][A-Za-z0-9_]*)\s*$", text, flags=re.M)
+    if m:
+        name = m.group(1)
+    else:
+        m = re.search(r"^\s*(Web\s*Panel|Transaction|Procedure|Data\s*Provider|SDT|Smart\s*Device)\s*[:=]\s*([A-Za-z_][A-Za-z0-9_]*)",
+                      text, flags=re.I | re.M)
+        if m:
+            name = m.group(2)
+
+    otype = None
+    m = re.search(r"^\s*Type\s*[:=]\s*(.+?)\s*$", text, flags=re.I | re.M)
+    if m:
+        otype = m.group(1).strip()
+
+    title = ""
+    m = re.search(r"^\s*(?:Title|Caption)\s*[:=]\s*(.+?)\s*$", text, flags=re.I | re.M)
+    if m:
+        title = m.group(1).strip()
+
+    desc = ""
+    m = re.search(r"^\s*(?:Description|Doc|Documentation)\s*[:=]\s*(.+?)\s*$", text, flags=re.I | re.M)
+    if m:
+        desc = m.group(1).strip()
+
+    keywords = re.findall(r"\b(Search|Filter|Grid|For\s+each|Link|Call|Export|Import|Approve|Login|Sync|REST)\b",
+                          text, flags=re.I)
+    hints = ",".join(sorted(set(k.lower() for k in keywords)))[:300] if keywords else ""
+    return name, otype, title, desc, hints
+
+
+def normalize_object_type(raw_type: Optional[str], guessed: str, filename: str, text: str) -> str:
+    rt = (raw_type or "").strip().lower()
+    if "web panel" in rt or rt in ("wp", "webpanel"):
+        return "WP"
+    if "workwith" in rt or "work with" in rt or "workwithplus" in rt or rt == "wwp":
+        return "WWP"
+    if "smart device" in rt or "sd panel" in rt or "sdpanel" in rt:
+        return "SD"
+    if "structured data type" in rt or rt == "sdt":
+        return "SDT"
+    if "transaction" in rt or rt == "trn":
+        return "Transaction"
+    if "procedure" in rt or rt == "proc":
+        return "Procedure"
+    if "data provider" in rt or rt == "dp" or "dataprovider" in rt:
+        return "DP"
+    if "api object" in rt or "apiobject" in rt:
+        return "API"
+    if "theme" in rt:
+        return "Theme"
+
+    if guessed in ("WP", "WWP", "SD", "SDT", "Transaction", "Procedure", "DP", "REST", "API", "Theme"):
+        return guessed
+
+    fn = filename.lower()
+    if "workwith" in fn or fn.endswith("ww.xml") or fn.endswith("wwp.xml"):
+        return "WWP"
+    if "sdt" in fn:
+        return "SDT"
+    if "trn" in fn or "transaction" in fn:
+        return "Transaction"
+    if "proc" in fn or "procedure" in fn:
+        return "Procedure"
+    if "dp" in fn or "dataprovider" in fn:
+        return "DP"
+    if "sd" in fn and ("panel" in fn or "smart" in text.lower()):
+        return "SD"
+    return "Unknown"
+
+
+def infer_entity(object_name: str, text: str) -> str:
+    m = re.search(r"\b(Transaction|Trn)\s*[:=]\s*([A-Za-z_][A-Za-z0-9_]*)", text, flags=re.I)
+    if m:
+        return m.group(2)
+
+    name = object_name
+    for suf in ("WW", "View", "Detail", "Prompt", "Picker", "List", "Grid", "SD", "Panel"):
+        if name.lower().endswith(suf.lower()) and len(name) > len(suf) + 1:
+            name = name[: -len(suf)]
+            break
+    m = re.match(r"WorkWith(.+)$", name, flags=re.I)
+    if m and is_probable_name(m.group(1)):
+        return m.group(1)
+    return name
+
+
+def infer_actions(object_name: str, object_type: str, text: str, title: str) -> List[str]:
+    actions: List[str] = []
+
+    if object_type == "WWP":
+        for rgx, act in WWP_NAME_RULES:
+            if rgx.search(object_name):
+                actions.extend(act.split("/"))
+                break
+
+    if object_type in ("WP", "SD"):
+        if re.search(r"\b(grid|for\s+each)\b", text, flags=re.I):
+            actions.append("一覧")
+        if re.search(r"\b(search|filter|where\s+.*like)\b", text, flags=re.I):
+            actions.append("検索")
+
+    if object_type == "Transaction":
+        actions.extend(["新規", "更新", "削除"])
+
+    if object_type in ("Procedure", "DP", "REST", "API"):
+        name_l = object_name.lower()
+        if name_l.startswith(("get", "find", "query")):
+            actions.append("検索")
+        if name_l.startswith(("list", "search", "load")):
+            actions.extend(["一覧", "検索"])
+        if name_l.startswith(("create", "insert", "add", "new")):
+            actions.append("新規")
+        if name_l.startswith(("update", "edit", "set")):
+            actions.append("更新")
+        if name_l.startswith(("delete", "remove")):
+            actions.append("削除")
+        if name_l.startswith(("export", "download")):
+            actions.append("エクスポート")
+        if name_l.startswith(("import", "upload")):
+            actions.append("インポート")
+        if name_l.startswith(("sync", "push", "pull")):
+            actions.append("同期")
+        if name_l.startswith(("login", "auth")):
+            actions.append("ログイン")
+
+    combined = f"{title}\n{text}"
+    for rgx, act in ACTION_PATTERNS:
+        if rgx.search(combined):
+            actions.append(act)
+
+    out, seen = [], set()
+    for a in actions:
+        if a and a not in seen:
+            out.append(a)
+            seen.add(a)
+
+    if not out:
+        out = ["データモデル"] if object_type == "SDT" else ["機能"]
+    return out
+
+
+def make_feature_names(entity: str, object_type: str, actions: List[str]) -> List[str]:
+    if "一覧" in actions and "検索" in actions:
+        return [f"{entity} 一覧検索"]
+    if object_type == "Transaction" and all(x in actions for x in ("新規", "更新", "削除")):
+        return [f"{entity} メンテナンス（新規/更新/削除）"]
+    res = []
+    for act in actions:
+        if act == "詳細":
+            res.append(f"{entity} 詳細表示")
+        elif act == "データモデル":
+            res.append(f"{entity} データモデル")
+        elif act == "機能":
+            res.append(f"{entity} 機能")
+        else:
+            res.append(f"{entity} {act}")
+    out, seen = [], set()
+    for x in res:
+        if x not in seen:
+            out.append(x)
+            seen.add(x)
+    return out[:3]
+
+
+def parse_design_file(path: Path, source_label: str) -> List[DesignObject]:
+    text = read_text_safely(path)
+    filename = path.name.lower()
+
+    if filename.endswith((".xml", ".gxobj", ".gxd", ".gxl")) or text.lstrip().startswith("<"):
+        name, otype, title, desc, hints = extract_name_type_title_from_xml(text)
+        guessed = guess_type_from_text(text, path.name)
+        object_type = normalize_object_type(otype, guessed, path.name, text)
+        if name and is_probable_name(name):
+            entity = infer_entity(name, text)
+            actions = infer_actions(name, object_type, text, title)
+            features = make_feature_names(entity, object_type, actions)
+            return [DesignObject(
+                object_name=name, object_type=object_type, source_file=source_label,
+                title=title, description=desc, raw_hints=hints,
+                inferred_entity=entity, inferred_actions=",".join(actions),
+                feature_names=",".join(features),
+            )]
+        return []
+
+    if filename.endswith(".json"):
+        try:
+            data = json.loads(text)
+            name = data.get("ObjectName") or data.get("Name")
+            otype = data.get("ObjectType") or data.get("Type")
+            title = data.get("Title") or data.get("Caption") or ""
+            desc = data.get("Description") or ""
+            guessed = guess_type_from_text(text, path.name)
+            object_type = normalize_object_type(otype, guessed, path.name, text)
+            if name and is_probable_name(name):
+                entity = infer_entity(name, text)
+                actions = infer_actions(name, object_type, text, title)
+                features = make_feature_names(entity, object_type, actions)
+                return [DesignObject(
+                    object_name=name, object_type=object_type, source_file=source_label,
+                    title=title, description=desc, raw_hints="json",
+                    inferred_entity=entity, inferred_actions=",".join(actions),
+                    feature_names=",".join(features),
+                )]
+        except Exception:
+            pass
+
+    name, otype, title, desc, hints = extract_name_type_title_from_text(text)
+    guessed = guess_type_from_text(text, path.name)
+    object_type = normalize_object_type(otype, guessed, path.name, text)
+
+    if not (name and is_probable_name(name)):
+        stem = path.stem
+        name = stem if is_probable_name(stem) else None
+
+    if name:
+        entity = infer_entity(name, text)
+        actions = infer_actions(name, object_type, text, title)
+        features = make_feature_names(entity, object_type, actions)
+        return [DesignObject(
+            object_name=name, object_type=object_type, source_file=source_label,
+            title=title, description=desc, raw_hints=hints or "filename",
+            inferred_entity=entity, inferred_actions=",".join(actions),
+            feature_names=",".join(features),
+        )]
+    return []
+
+
+def iter_design_files(design_dir: Path) -> List[Tuple[Path, str]]:
+    items: List[Tuple[Path, str]] = []
+    extract_root = design_dir / ".tmp_extract"
+    if extract_root.exists():
+        for old in extract_root.rglob("*"):
+            if old.is_file():
+                try:
+                    old.unlink()
+                except Exception:
+                    pass
+
+    for p in design_dir.rglob("*"):
+        if p.is_dir():
+            continue
+        lower = p.name.lower()
+        if lower.endswith((".xpz", ".zip")):
+            out_dir = extract_root / (p.stem + "_extracted")
+            ensure_dir(out_dir)
+            try:
+                with zipfile.ZipFile(p, "r") as zf:
+                    zf.extractall(out_dir)
+                for q in out_dir.rglob("*"):
+                    if q.is_file():
+                        items.append((q, f"archive:{p.name}:{q.relative_to(out_dir)}"))
+            except Exception:
+                continue
+        else:
+            items.append((p, str(p.relative_to(design_dir))))
+    return items
+
+
+def build_design_objects(design_dir: Path) -> List[DesignObject]:
+    objs: List[DesignObject] = []
+    for p, label in iter_design_files(design_dir):
+        if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".pdf", ".docx", ".xlsx", ".pptx"):
+            continue
+        try:
+            objs.extend(parse_design_file(p, label))
+        except Exception:
+            continue
+
+    best: Dict[Tuple[str, str], DesignObject] = {}
+    for o in objs:
+        key = (o.object_name, o.object_type)
+        if key not in best:
+            best[key] = o
+        else:
+            cur = best[key]
+            score_cur = len(cur.title) + len(cur.description) + len(cur.raw_hints)
+            score_new = len(o.title) + len(o.description) + len(o.raw_hints)
+            if score_new > score_cur:
+                best[key] = o
+    return list(best.values())
+
+
+def build_feature_design_rows(objs: List[DesignObject]) -> List[Dict]:
+    rows: List[Dict] = []
+    for o in objs:
+        feats = [x.strip() for x in o.feature_names.split(",") if x.strip()] or [f"{o.inferred_entity or o.object_name} 機能"]
+        for f in feats:
+            rows.append({
+                "機能名": f,
+                "設計オブジェクト種別": o.object_type,
+                "設計オブジェクト名": o.object_name,
+                "エンティティ(推定)": o.inferred_entity,
+                "アクション(推定)": o.inferred_actions,
+                "タイトル/Caption": o.title,
+                "説明/Doc": o.description,
+                "ヒント": o.raw_hints,
+                "元ファイル": o.source_file,
+            })
+    return rows
+
+
+def build_feature_group_rows(feature_design_rows: List[Dict]) -> List[Dict]:
+    group: Dict[str, List[Tuple[str, str]]] = {}
+    for r in feature_design_rows:
+        group.setdefault(r["機能名"], []).append((r["設計オブジェクト種別"], r["設計オブジェクト名"]))
+
+    out: List[Dict] = []
+    for f, lst in sorted(group.items(), key=lambda x: x[0]):
+        objs = "; ".join([f"{t}:{n}" for t, n in sorted(set(lst))])
+        out.append({"機能名": f, "対応設計オブジェクト": objs, "オブジェクト数": len(set(lst))})
+    return out
+
+
+JAVA_CLASS_RE = re.compile(r"^\s*(public\s+)?(final\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)\b", re.M)
+
+
+def index_java_files(java_dir: Path) -> Tuple[Dict[str, List[Path]], Dict[str, List[Path]]]:
+    by_stem: Dict[str, List[Path]] = {}
+    by_token: Dict[str, List[Path]] = {}
+    for p in java_dir.rglob("*.java"):
+        sn = normalize_key(p.stem)
+        by_stem.setdefault(sn, []).append(p)
+        for tok in set(camel_tokens(p.stem)):
+            by_token.setdefault(tok, []).append(p)
+    return by_stem, by_token
+
+
+def match_java_for_object(obj: DesignObject,
+                          by_stem: Dict[str, List[Path]],
+                          by_token: Dict[str, List[Path]],
+                          java_dir: Path) -> List[Dict]:
+    name = obj.object_name
+    candidates = [name, name.lower(), name.upper(), "a" + name, "A" + name]
+    cand_norms = [normalize_key(c) for c in candidates if c]
+
+    matches: List[Tuple[float, str, Path]] = []
+
+    for cn in cand_norms:
+        for p in by_stem.get(cn, []):
+            matches.append((0.95, "filename_stem_match", p))
+
+    if not matches:
+        toks = camel_tokens(name)
+        primary = toks[0] if toks else normalize_key(name)
+        pool = by_token.get(primary, [])[:2000]
+        for p in pool:
+            try:
+                head = read_text_safely(p, max_bytes=200_000)
+            except Exception:
+                continue
+            cm = JAVA_CLASS_RE.search(head)
+            if cm and normalize_key(cm.group(3)) == normalize_key(name):
+                matches.append((0.85, "class_name_match_in_file", p))
+                continue
+            if name in head:
+                matches.append((0.60, "content_contains_object_name", p))
+
+    if not matches:
+        nn = normalize_key(name)
+        for stem_norm, paths in by_stem.items():
+            if nn and nn in stem_norm:
+                for p in paths[:5]:
+                    matches.append((0.40, "stem_contains_name", p))
+            if len(matches) >= 10:
+                break
+
+    best: Dict[str, Tuple[float, str, Path]] = {}
+    for sc, method, p in matches:
+        k = str(p)
+        if k not in best or sc > best[k][0]:
+            best[k] = (sc, method, p)
+
+    ranked = sorted(best.values(), key=lambda x: (-x[0], x[2].name))[:5]
+    out = [{
+        "設計オブジェクト種別": obj.object_type,
+        "設計オブジェクト名": obj.object_name,
+        "機能名(推定)": obj.feature_names,
+        "Javaファイル": str(p.relative_to(java_dir)),
+        "マッチ方法": method,
+        "信頼度": round(sc, 2),
+    } for sc, method, p in ranked]
+
+    if not out:
+        out.append({
+            "設計オブジェクト種別": obj.object_type,
+            "設計オブジェクト名": obj.object_name,
+            "機能名(推定)": obj.feature_names,
+            "Javaファイル": "",
+            "マッチ方法": "not_found",
+            "信頼度": 0.0,
+        })
+    return out
+
+
+def build_design_java_rows(objs: List[DesignObject], java_src_dir: Path) -> List[Dict]:
+    by_stem, by_token = index_java_files(java_src_dir)
+    rows: List[Dict] = []
+    for o in objs:
+        if o.object_type == "Theme":
+            continue
+        rows.extend(match_java_for_object(o, by_stem, by_token, java_src_dir))
+    return rows
+
+
+def autosize_worksheet(ws, max_width: int = 60) -> None:
+    widths: Dict[int, int] = {}
+    for row in ws.iter_rows(values_only=True):
+        for i, val in enumerate(row, start=1):
+            s = "" if val is None else str(val)
+            widths[i] = max(widths.get(i, 0), len(s))
+    for i, w in widths.items():
+        ws.column_dimensions[get_column_letter(i)].width = min(max(10, w + 2), max_width)
+
+
+def write_sheet(wb: Workbook, title: str, rows: List[Dict]) -> None:
+    ws = wb.create_sheet(title)
+    if not rows:
+        ws.append(["(empty)"])
+        return
+    headers = list(rows[0].keys())
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(vertical="top", wrap_text=True)
+    for r in rows:
+        ws.append([r.get(h, "") for h in headers])
+    ws.freeze_panes = "A2"
+    for row in ws.iter_rows(min_row=2):
+        for c in row:
+            c.alignment = Alignment(vertical="top", wrap_text=True)
+    autosize_worksheet(ws)
+
+
+def save_excel(out_path: Path,
+               feature_design_rows: List[Dict],
+               feature_group_rows: List[Dict],
+               design_java_rows: List[Dict]) -> None:
+    wb = Workbook()
+    wb.remove(wb.active)
+    write_sheet(wb, "Feature_Design", feature_design_rows)
+    write_sheet(wb, "Feature_Group", feature_group_rows)
+    write_sheet(wb, "Design_Java", design_java_rows)
+    wb.save(out_path)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="GeneXus: Feature-Design & Design-Java traceability tables")
+    ap.add_argument("--design_dir", required=True, help="Folder containing exported design files (xml/txt/xpz/zip)")
+    ap.add_argument("--java_dir", required=False, default="", help="Java source root, e.g. JavaModel/src/main/java")
+    ap.add_argument("--out", required=True, help="Output Excel file path (.xlsx)")
+    ap.add_argument("--dump_objects_json", default="", help="Optional: dump parsed objects to JSON")
+    args = ap.parse_args()
+
+    design_dir = Path(args.design_dir).resolve()
+    if not design_dir.exists():
+        print(f"[ERROR] design_dir not found: {design_dir}", file=sys.stderr)
+        sys.exit(2)
+
+    out_path = Path(args.out).resolve()
+    ensure_dir(out_path.parent)
+
+    objs = build_design_objects(design_dir)
+    objs = sorted(objs, key=lambda o: (o.object_type, o.object_name))
+
+    feature_design_rows = build_feature_design_rows(objs)
+    feature_group_rows = build_feature_group_rows(feature_design_rows)
+
+    if args.dump_objects_json:
+        dump_path = Path(args.dump_objects_json).resolve()
+        ensure_dir(dump_path.parent)
+        dump_path.write_text(json.dumps([asdict(o) for o in objs], ensure_ascii=False, indent=2), encoding="utf-8")
+
+    design_java_rows: List[Dict] = []
+    if args.java_dir:
+        java_dir = Path(args.java_dir).resolve()
+        if not java_dir.exists():
+            print(f"[WARN] java_dir not found, skip java mapping: {java_dir}", file=sys.stderr)
+        else:
+            design_java_rows = build_design_java_rows(objs, java_dir)
+
+    save_excel(out_path, feature_design_rows, feature_group_rows, design_java_rows)
+    print(f"[OK] Written: {out_path}")
+    print(f"[OK] Objects: {len(objs)} | Feature rows: {len(feature_design_rows)} | Java rows: {len(design_java_rows)}")
+
+
+if __name__ == "__main__":
+    main()
