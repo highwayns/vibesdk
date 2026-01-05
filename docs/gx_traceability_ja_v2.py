@@ -12,6 +12,7 @@ import json
 import re
 import sys
 import zipfile
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -32,13 +33,35 @@ def read_text_safely(path: Path, max_bytes: int = 2_000_000) -> str:
     return data.decode("utf-8", errors="ignore")
 
 
+GX_GENERIC_NAMES = {
+    # GeneXus の XML 内で頻出する「プロパティ名」や汎用語（これを Object 名として誤検出しがち）
+    "name", "value", "description", "desc", "title", "caption",
+    "isdefault", "length", "attmaxlen", "attcustomtype", "enumdefinedvalues",
+    "properties", "property", "object", "objectname", "objname", "type",
+}
+
 def is_probable_name(s: str) -> bool:
+    """GeneXus オブジェクト名として妥当かを判定。
+
+    - 単純名: Foo_Bar123
+    - fullyQualifiedName: JB.HTGK.HTGK023R_DP01 のようなドット区切りも許容
+    """
     if not s:
         return False
     s = s.strip()
-    if len(s) > 80:
+    if len(s) > 120:
         return False
-    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", s))
+    if s.lower() in GX_GENERIC_NAMES:
+        return False
+
+    seg_pat = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+    if "." in s:
+        segs = [x for x in s.split(".") if x]
+        if not (1 <= len(segs) <= 12):
+            return False
+        return all(seg_pat.fullmatch(seg) for seg in segs)
+
+    return bool(seg_pat.fullmatch(s))
 
 
 def normalize_key(s: str) -> str:
@@ -118,42 +141,103 @@ def guess_type_from_text(text: str, filename: str) -> str:
     return best[0] if best[1] > 0 else "Unknown"
 
 
-def extract_name_type_title_from_xml(xml_text: str) -> Tuple[Optional[str], Optional[str], str, str, str]:
-    def pick_first(patterns: List[str]) -> Optional[str]:
-        for pat in patterns:
-            m = re.search(pat, xml_text, flags=re.I | re.S)
-            if m:
-                val = re.sub(r"\s+", " ", m.group(1)).strip()
-                if val:
-                    return val
-        return None
+def extract_name_type_title_from_xml(xml_text: str) -> Tuple[Optional[str], Optional[str], str, str, str, Dict[str, str]]:
+    """GeneXus 由来の XML/擬似XMLから name/type/title/description をできるだけ正確に拾う。
 
-    name = pick_first([
-        r"<\s*(?:ObjectName|ObjName|Name)\s*>\s*([^<\s][^<]{0,120}?)\s*</\s*(?:ObjectName|ObjName|Name)\s*>",
-        r'"\s*(?:ObjectName|ObjName|Name)\s*"\s*:\s*"\s*([^"]+?)\s*"',
-    ])
-    if name and not is_probable_name(name):
-        candidates = re.findall(r"<\s*Name\s*>\s*([A-Za-z_][A-Za-z0-9_]{1,60})\s*</\s*Name\s*>", xml_text)
-        name = next((c for c in candidates if is_probable_name(c)), None)
+    重要:
+    - 画像の形式のように <Property><Name>IsDefault</Name>... が先頭に出るXMLだと、
+      単純な <Name> 正規表現は「IsDefault」を Object 名として誤検出する。
+    - そのため、(1) <Object ... name/fullyQualifiedName/description 属性 → (2) Properties の Name/Value ペア
+      の順で拾う。
+    """
+    xml_text = xml_text.strip()
+    props: Dict[str, str] = {}
 
-    otype = pick_first([
-        r"<\s*(?:ObjectType|Type|Category|Class)\s*>\s*([^<]{1,80}?)\s*</\s*(?:ObjectType|Type|Category|Class)\s*>",
-        r'"\s*(?:ObjectType|Type|Category|Class)\s*"\s*:\s*"\s*([^"]+?)\s*"',
-    ])
+    def clean(s: str) -> str:
+        return re.sub(r"\s+", " ", s or "").strip()
 
-    title = pick_first([
-        r"<\s*(?:Title|Caption|FormCaption|Text)\s*>\s*([^<]{1,200}?)\s*</\s*(?:Title|Caption|FormCaption|Text)\s*>"
-    ]) or ""
-    desc = pick_first([
-        r"<\s*(?:Description|Desc|Documentation|Comment)\s*>\s*([^<]{1,400}?)\s*</\s*(?:Description|Desc|Documentation|Comment)\s*>"
-    ]) or ""
+    def add_prop(k: str, v: str) -> None:
+        k = clean(k)
+        v = clean(v)
+        if k and v and k not in props:
+            props[k] = v
+
+    # --- 1) XML パーサで読む（可能ならこれが最も安全）
+    root = None
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        root = None
+
+    attrs: Dict[str, str] = {}
+    if root is not None:
+        attrs = {k: clean(v) for k, v in root.attrib.items()}
+        # Properties/Property の Name/Value を辞書化
+        for prop in root.findall(".//Properties/Property"):
+            k = prop.findtext("Name") or ""
+            v = prop.findtext("Value") or ""
+            add_prop(k, v)
+
+    # --- 2) パースできない場合のフォールバック（正規表現で属性/Name-Valueペアのみ拾う）
+    if not attrs:
+        m = re.search(r"<\s*Object\b([^>]*)>", xml_text, flags=re.I)
+        if m:
+            attr_blob = m.group(1)
+            for k, v in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\"([^\"]*)\"", attr_blob):
+                attrs[k] = clean(v)
+    if not props:
+        for k, v in re.findall(r"<\s*Property\s*>\s*<\s*Name\s*>\s*([^<]+?)\s*</\s*Name\s*>\s*<\s*Value\s*>\s*(.*?)\s*</\s*Value\s*>\s*</\s*Property\s*>",
+                               xml_text, flags=re.I | re.S):
+            add_prop(k, v)
+
+    # --- 候補の組み立て（優先順位つき）
+    name_cands: List[str] = []
+    # 画像の例: <Object ... fullyQualifiedName="DaiLstSel" name="DaiLstSel" ...>
+    name_cands += [attrs.get("fullyQualifiedName", ""), attrs.get("name", "")]
+    # Properties の Name/ObjName/ObjectName
+    name_cands += [props.get("Name", ""), props.get("ObjectName", ""), props.get("ObjName", "")]
+    name = next((c for c in (clean(x) for x in name_cands) if is_probable_name(c)), None)
+
+    # type は文字列型が取れれば使う（無い場合は後段の guess/normalize に任せる）
+    type_cands: List[str] = []
+    type_cands += [attrs.get("objectType", ""), attrs.get("typeName", ""), props.get("ObjectType", ""), props.get("Type", "")]
+    otype = next((c for c in (clean(x) for x in type_cands) if c), None)
+
+    # title/description（画像の例では description 属性に日本語が入る）
+    title = clean(props.get("Title", "") or props.get("Caption", ""))
+    desc = clean(attrs.get("description", "") or props.get("Description", "") or props.get("Desc", ""))
 
     keywords = re.findall(r"\b(Search|Filter|Grid|For\s+each|Link|Call|Export|Import|Approve|Login|Sync|REST|SDT|DataProvider)\b",
                           xml_text, flags=re.I)
     hints = ",".join(sorted(set(k.lower() for k in keywords)))[:300] if keywords else ""
-    return name, otype, title, desc, hints
+    if "EnumDefinedValues" in props:
+        hints = (hints + ("," if hints else "") + "enum")[:300]
+
+    return name, otype, title, desc, hints, props
 
 
+def parse_enum_defined_values(raw: str) -> List[str]:
+    """EnumDefinedValues の Value から「表示ラベル」部分を抽出する。
+    例: '4. Cnc|RegCptNoti|fModRcptNoti, 解約申込受領通知・変更申込受領通知' → '解約申込受領通知・変更申込受領通知'
+    """
+    raw = re.sub(r"\s+", " ", raw or "").strip()
+    if not raw:
+        return []
+    # 区切り（GeneXus の出力で全角コロンが多い）
+    parts = re.split(r"[：:]\s*(?=\d+\.)", raw)
+    out: List[str] = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        # 'n. code, label' の label を優先
+        m = re.match(r"\d+\.\s*[^,]{1,200},\s*(.+)$", p)
+        label = m.group(1).strip() if m else p
+        # 末尾の不要記号を除去
+        label = label.strip(" ：:;")
+        if label and label not in out:
+            out.append(label)
+    return out
 def extract_name_type_title_from_text(text: str) -> Tuple[Optional[str], Optional[str], str, str, str]:
     name = None
     m = re.search(r"^\s*(?:Object|Name)\s*[:=]\s*([A-Za-z_][A-Za-z0-9_]*)\s*$", text, flags=re.M)
@@ -227,11 +311,14 @@ def normalize_object_type(raw_type: Optional[str], guessed: str, filename: str, 
 
 
 def infer_entity(object_name: str, text: str) -> str:
+    # fullyQualifiedName の場合は末尾セグメントをベースに推定する
+    base_name = (object_name.split(".")[-1] if object_name else object_name)
+
     m = re.search(r"\b(Transaction|Trn)\s*[:=]\s*([A-Za-z_][A-Za-z0-9_]*)", text, flags=re.I)
     if m:
         return m.group(2)
 
-    name = object_name
+    name = base_name
     for suf in ("WW", "View", "Detail", "Prompt", "Picker", "List", "Grid", "SD", "Panel"):
         if name.lower().endswith(suf.lower()) and len(name) > len(suf) + 1:
             name = name[: -len(suf)]
@@ -280,6 +367,14 @@ def infer_actions(object_name: str, object_type: str, text: str, title: str) -> 
             actions.append("同期")
         if name_l.startswith(("login", "auth")):
             actions.append("ログイン")
+        # 帳票/出力 系（DP/Procedure で多い）
+        combined_local = f"{title}\n{text}"
+        if re.search(r"(帳票|発行|印刷|出力|レポート|PDF|Excel|CSV)", combined_local):
+            actions.append("出力")
+        # 連携/同期 系
+        if re.search(r"(連携|同期|インタフェース|インターフェース|I/F|IF|送信|受信|取込|取り込み)", combined_local):
+            actions.append("連携")
+
 
     combined = f"{title}\n{text}"
     for rgx, act in ACTION_PATTERNS:
@@ -298,12 +393,29 @@ def infer_actions(object_name: str, object_type: str, text: str, title: str) -> 
 
 
 def make_feature_names(entity: str, object_type: str, actions: List[str]) -> List[str]:
+    # 「一覧 + 検索」などの定番はまとめる
     if "一覧" in actions and "検索" in actions:
         return [f"{entity} 一覧検索"]
     if object_type == "Transaction" and all(x in actions for x in ("新規", "更新", "削除")):
         return [f"{entity} メンテナンス（新規/更新/削除）"]
-    res = []
-    for act in actions:
+
+    def has_ja(s: str) -> bool:
+        return any(ord(ch) > 127 for ch in s)
+
+    uniq_actions: List[str] = []
+    for a in actions:
+        if a not in uniq_actions:
+            uniq_actions.append(a)
+
+    # エンティティが日本語で、かつデフォルト(機能)しか出ていない場合は冗長なので entity 単体にする
+    if entity and has_ja(entity):
+        if re.search(r"(発行|帳票|出力|印刷|レポート)", entity):
+            return [entity]
+        if uniq_actions == ["機能"]:
+            return [entity]
+
+    res: List[str] = []
+    for act in uniq_actions:
         if act == "詳細":
             res.append(f"{entity} 詳細表示")
         elif act == "データモデル":
@@ -312,6 +424,7 @@ def make_feature_names(entity: str, object_type: str, actions: List[str]) -> Lis
             res.append(f"{entity} 機能")
         else:
             res.append(f"{entity} {act}")
+
     out, seen = [], set()
     for x in res:
         if x not in seen:
@@ -325,13 +438,28 @@ def parse_design_file(path: Path, source_label: str) -> List[DesignObject]:
     filename = path.name.lower()
 
     if filename.endswith((".xml", ".gxobj", ".gxd", ".gxl")) or text.lstrip().startswith("<"):
-        name, otype, title, desc, hints = extract_name_type_title_from_xml(text)
+        name, otype, title, desc, hints, props = extract_name_type_title_from_xml(text)
         guessed = guess_type_from_text(text, path.name)
         object_type = normalize_object_type(otype, guessed, path.name, text)
-        if name and is_probable_name(name):
+
+        # XML で名前が取れない場合でも、ファイル名から最低限のオブジェクトを作る（Objects=1 を防ぐ）
+        if not (name and is_probable_name(name)):
+            stem = path.stem
+            name = stem if is_probable_name(stem) else None
+
+        if name:
             entity = infer_entity(name, text)
             actions = infer_actions(name, object_type, text, title)
-            features = make_feature_names(entity, object_type, actions)
+
+            # EnumDefinedValues がある場合：画像のような「選択肢＝機能候補」を機能として展開
+            enum_labels = parse_enum_defined_values(props.get("EnumDefinedValues", ""))
+            display_entity = (desc or title or entity or name)
+
+            if enum_labels:
+                features = [f"{display_entity}：{lab}" for lab in enum_labels][:30]
+            else:
+                features = make_feature_names(display_entity, object_type, actions)
+
             return [DesignObject(
                 object_name=name, object_type=object_type, source_file=source_label,
                 title=title, description=desc, raw_hints=hints,
@@ -339,6 +467,7 @@ def parse_design_file(path: Path, source_label: str) -> List[DesignObject]:
                 feature_names=",".join(features),
             )]
         return []
+
 
     if filename.endswith(".json"):
         try:
