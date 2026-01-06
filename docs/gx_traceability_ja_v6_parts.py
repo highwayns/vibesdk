@@ -561,46 +561,80 @@ def extract_objects_from_xml(xml_text: str, source_label: str) -> List[Dict]:
         pass
 
     # Regex fallback for malformed "Object header + plain source text"
-    # Extract attributes in first <Object ...> line.
-    m = re.search(r"<Object\s+([^>]+)>", xml_text, flags=re.I)
-    if m:
-        attr_text = m.group(1)
-        attrs = dict(re.findall(r'(\w+)\s*=\s*"([^"]*)"', attr_text))
-        # normalize keys
-        attrs_norm = {k: clean(v) for k, v in attrs.items()}
-        # build fake element for source collect (we cannot, but we can regex extract <Source>)
-        sources = []
-        for sm in re.finditer(r"<Source[^>]*>(.*?)</Source>", xml_text, flags=re.I | re.S):
-            s = sm.group(1)
-            s = re.sub(r"\r\n?", "\n", s).strip()
-            if s:
-                sources.append(s)
-        guid = attrs_norm.get("guid", "")
-        parent_guid = attrs_norm.get("parentGuid", "")
-        module_guid = attrs_norm.get("moduleGuid", "")
-        fq = attrs_norm.get("fullyQualifiedName", "")
-        name = attrs_norm.get("name", "")
-        object_name = fq if fq and (len(fq) >= len(name)) else name
-        raw_type_id = attrs_norm.get("type", "") or attrs_norm.get("objectType", "")
-        desc = attrs_norm.get("description", "")
+    # Some GeneXus exports are not well-formed XML (e.g., <Object ...> header followed by plain code),
+    # or may contain multiple <Object ...> blocks. In this case, extract ALL Object headers by regex.
+    obj_starts = list(re.finditer(r"<Object\b([^>]*)>", xml_text, flags=re.I))
+    if obj_starts:
+        # Helper: extract blobs for known Part tags from a text segment
+        def _extract_part_blobs(seg: str) -> Dict[str, str]:
+            parts: Dict[str, str] = {}
+            # Common "user editable" parts across object types (per GeneXus)
+            for tag in ("Source","Rules","Variables","Parm","Events","Layout","Attributes","Structure","Style"):
+                blobs = []
+                for pm in re.finditer(rf"<{tag}\b[^>]*>(.*?)</{tag}>", seg, flags=re.I | re.S):
+                    b = re.sub(r"\r\n?", "\n", pm.group(1)).strip()
+                    if b:
+                        blobs.append(b)
+                if blobs:
+                    parts[tag.lower()] = "\n\n---\n\n".join(blobs)
+            return parts
 
-        recs.append({
-            "guid": guid,
-            "parent_guid": parent_guid,
-            "module_guid": module_guid,
-            "fully_qualified_name": fq,
-            "object_name": clean(object_name),
-            "raw_type_id": raw_type_id,
-            "raw_type_name": attrs_norm.get("typeName", "") or "",
-            "title": "",
-            "description": clean(desc),
-            "hints": "",
-            "sources": sources,
-            "parts": {},
-            "parts_all": "",
-            "source_file": source_label,
-            "text_sample": xml_text[:5000].lower(),
-        })
+        for i, m in enumerate(obj_starts):
+            attr_text = m.group(1)
+            # Segment for this Object: from end of start-tag to next Object start (or EOF)
+            seg_start = m.end()
+            seg_end = obj_starts[i + 1].start() if i + 1 < len(obj_starts) else len(xml_text)
+            segment = xml_text[seg_start:seg_end]
+
+            attrs = dict(re.findall(r'(\w+)\s*=\s*"([^"]*)"', attr_text))
+            attrs_norm = {k: clean(v) for k, v in attrs.items()}
+
+            fq = attrs_norm.get("fullyQualifiedName", "") or attrs_norm.get("FullyQualifiedName", "") or ""
+            nm = attrs_norm.get("name", "") or attrs_norm.get("Name", "") or ""
+            object_name = fq if (fq and "." in fq and len(fq) >= max(8, len(nm))) else (nm or fq)
+
+            raw_type_id = attrs_norm.get("type", "") or attrs_norm.get("objectType", "") or attrs_norm.get("ObjectType", "")
+            raw_type_name = attrs_norm.get("typeName", "") or attrs_norm.get("objectTypeName", "") or attrs_norm.get("TypeName", "")
+
+            desc = attrs_norm.get("description", "") or attrs_norm.get("Description", "") or ""
+
+            # Collect <Source> tags inside this Object segment (often nested under Parts).
+            sources: List[str] = []
+            for sm in re.finditer(r"<Source\b[^>]*>(.*?)</Source>", segment, flags=re.I | re.S):
+                s = re.sub(r"\r\n?", "\n", sm.group(1)).strip()
+                if s:
+                    sources.append(s)
+
+            # If no explicit <Source> tags, treat the raw segment text (without tags) as a "source-like" blob.
+            if not sources:
+                # Remove XML-ish tags; keep plain code/text.
+                seg_no_tags = re.sub(r"<[^>]+>", "", segment)
+                seg_no_tags = re.sub(r"\r\n?", "\n", seg_no_tags).strip()
+                # Only accept if it contains some non-trivial code/text
+                if len(seg_no_tags) >= 20:
+                    sources.append(seg_no_tags[:200000])  # cap per object
+
+            parts = _extract_part_blobs(segment)
+            parts_all = re.sub(r"\r\n?", "\n", segment).strip()
+            parts_all = parts_all[:200000]  # cap to keep Excel reasonable
+
+            recs.append({
+                "guid": attrs_norm.get("guid", ""),
+                "parent_guid": attrs_norm.get("parentGuid", "") or attrs_norm.get("parentGUID", ""),
+                "module_guid": attrs_norm.get("moduleGuid", ""),
+                "fully_qualified_name": clean(fq),
+                "object_name": clean(object_name),
+                "raw_type_id": clean(raw_type_id),
+                "raw_type_name": clean(raw_type_name),
+                "title": "",
+                "description": clean(desc),
+                "hints": "",
+                "sources": sources,
+                "parts": parts,
+                "parts_all": parts_all,
+                "source_file": source_label,
+                "text_sample": (segment[:5000]).lower(),
+            })
     return recs
 
 
