@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GeneXus Traceability Builder v5 (hierarchy + parts Source)
+GeneXus Traceability Builder v9 (hierarchy + parts Source)
 - Stage 1: Parse GeneXus design exports (XML/JSON/text/XPZ/ZIP) -> build design object inventory (with GUID hierarchy) ->
            infer feature names -> Feature_Design / Feature_Group
 - Stage 2: Scan generated Java sources -> map design object -> Java files -> Design_Java
@@ -43,6 +43,27 @@ except Exception as e:  # pragma: no cover
 # -----------------------------
 
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+# -----------------------------
+# GeneXus internal object-type GUID mapping
+# NOTE: This mapping can vary slightly by GeneXus generation, but these suffixes are commonly observed.
+# We match by the last 4 digits of the final GUID block (12 digits).
+GX_TYPE_GUID_SUFFIX_MAP = {
+    # NOTE: 末尾4桁による種別推定は世代差でズレる可能性があるため、
+    # ここでは画像の指針で明示された Folder/Category（…0006）のみ特判定する。
+    "0006": ("Folder", "Folder / Category"),
+}
+
+def map_gx_type_guid(type_guid: str):
+    """Map a GeneXus object 'type' GUID to (normalized_type, display_name)."""
+    g = clean(type_guid)
+    if not g or not UUID_RE.match(g):
+        return None
+    last = g.split("-")[-1]  # 12 chars
+    suffix = last[-4:] if len(last) >= 4 else last
+    return GX_TYPE_GUID_SUFFIX_MAP.get(suffix)
+
 
 
 def is_uuid(s: str) -> bool:
@@ -149,6 +170,10 @@ TYPE_ALIASES = {
     "theme": "Theme",
     "thm": "Theme",
     "service": "API",
+
+    "gam": "GAM",
+    "gam object": "GAM",
+    "security": "GAM",
 }
 
 
@@ -157,6 +182,10 @@ def normalize_object_type(raw: str, filename: str = "", object_name: str = "") -
     r = clean(raw).lower()
     if r in TYPE_ALIASES:
         return TYPE_ALIASES[r]
+
+    mapped = map_gx_type_guid(raw)
+    if mapped:
+        return mapped[0]
 
     # If raw is a GUID, we cannot normalize directly. Try filename/object_name heuristics.
     name = (object_name or "")
@@ -190,6 +219,95 @@ TYPE_KEYWORDS_ORDERED = [
     ("API", [r"\brest\b", r"\bapi\b", r"\bservice\b"]),
     ("WP", [r"\bweb\s*panel\b", r"\bwebpanel\b"]),
 ]
+
+
+
+def _canonicalize_parts(parts: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """Part辞書のキーを正規化（Source/Rules/...）。
+    正規XML解析と正規表現フォールバックでキーの大小がブレるため、出力と判定を安定させる。
+    """
+    out: Dict[str, str] = {}
+    if not parts:
+        return out
+    canon = {t.lower(): t for t in PART_TAGS_ORDER}
+    for k, v in parts.items():
+        kk = clean(str(k))
+        if not kk:
+            continue
+        key = canon.get(kk.lower(), kk)  # 未知タグはそのまま保持
+        vv = (v or "").strip()
+        if not vv:
+            continue
+        if key in out and out[key]:
+            norm_existing = re.sub(r"\s+", " ", out[key]).strip()
+            norm_new = re.sub(r"\s+", " ", vv).strip()
+            if norm_new and norm_new != norm_existing:
+                out[key] = out[key] + "\n\n---\n\n" + vv
+        else:
+            out[key] = vv
+    return out
+
+
+def _type_guid_is_folder(type_guid: str) -> bool:
+    g = clean(type_guid)
+    if not g or not is_uuid(g):
+        return False
+    last = g.split("-")[-1]
+    suf = last[-4:] if len(last) >= 4 else last
+    return suf == "0006"
+
+
+def infer_object_type_from_parts(parts: Dict[str, str], parts_all: str, text_sample: str, raw_type_id: str) -> str:
+    """画像の指針（Part構成）から ObjectType を推定する（核心）。
+    ルール（優先順）:
+      - type=…0006 → Folder/Category
+      - Security / GAM Property → GAM Object
+      - Structure + Attributes + Rules → Transaction
+      - Source + Parm + Variables → Procedure
+      - Source + Output Structure → Data Provider
+      - Events + Layout + WWP系Property → WWP
+      - Events + Layout → Web Panel(WP)
+      - Structureのみ → SDT
+    """
+    parts = _canonicalize_parts(parts)
+    present = {k for k in PART_TAGS_ORDER if (parts.get(k, "") or "").strip()}
+
+    blob = ((parts_all or "") + "\n" + (text_sample or "")).lower()
+
+    # Folder / Category
+    if _type_guid_is_folder(raw_type_id):
+        return "Folder"
+
+    # GAM / Security
+    if re.search(r"<name>[^<]*(gam|security)[^<]*</name>", blob) or re.search(r"\bgam\b", blob):
+        return "GAM"
+
+    # Transaction
+    if {"Structure", "Attributes", "Rules"}.issubset(present):
+        return "Transaction"
+
+    # Procedure
+    if {"Source", "Parm", "Variables"}.issubset(present):
+        return "Procedure"
+
+    # Data Provider: Source + Output Structure
+    if "Source" in present:
+        if re.search(r"<output\b", blob) or "outputstructure" in blob or re.search(r"output\s+structure", blob):
+            return "DP"
+
+    # SDT: Structure only
+    if "Structure" in present:
+        other = present - {"Structure"}
+        if not other:
+            return "SDT"
+
+    # Web Panel / WWP (both have Events+Layout; WWP has WWP系Property)
+    if {"Events", "Layout"}.issubset(present):
+        if re.search(r"workwithplus", blob) or re.search(r"<name>[^<]*wwp[^<]*</name>", blob):
+            return "WWP"
+        return "WP"
+
+    return ""
 
 
 def guess_type_from_text(text: str, object_name: str, filename: str) -> str:
@@ -507,7 +625,7 @@ def extract_objects_from_xml(xml_text: str, source_label: str) -> List[Dict]:
                 type_hint = normalize_object_type(raw_type_id, filename=source_label, object_name=object_name)
         except Exception:
             type_hint = ""
-        parts_by_tag, parts_all = collect_parts_content(obj_elem, type_hint)
+        parts_by_tag, parts_all = collect_parts_content(obj_elem, "")  # 先に全Partを抽出（型推定は後段で実施）
 
 
         return {
@@ -576,7 +694,7 @@ def extract_objects_from_xml(xml_text: str, source_label: str) -> List[Dict]:
                     if b:
                         blobs.append(b)
                 if blobs:
-                    parts[tag.lower()] = "\n\n---\n\n".join(blobs)
+                    parts[tag] = "\n\n---\n\n".join(blobs)
             return parts
 
         for i, m in enumerate(obj_starts):
@@ -805,6 +923,10 @@ def build_design_objects(design_dir: Path, verbose: bool = False) -> List[Design
         tname = clean(r.get("raw_type_name", ""))
         if is_uuid(tid) and tname:
             type_registry[tid] = tname
+        elif is_uuid(tid) and tid and tid not in type_registry:
+            # 末尾4桁の固定マッピングは世代差でズレる可能性があるため採用しない。
+            # Folder/Category（…0006）のみは画像指針に従い、必要なら後段の Part 判定で拾う。
+            pass
 
     # Merge records by guid (preferred), else by fully qualified name, else by object_name+raw_type_id
     merged: Dict[str, Dict] = {}
@@ -859,20 +981,35 @@ def build_design_objects(design_dir: Path, verbose: bool = False) -> List[Design
         # Fill missing raw_type_name from registry if possible
         if not raw_type_name and is_uuid(raw_type_id) and raw_type_id in type_registry:
             raw_type_name = type_registry[raw_type_id]
-
         # Determine final object_type
-        obj_type = "Unknown"
+        # 1) まず raw_type_name（明示）を正規化
+        base_type = "Unknown"
         if raw_type_name:
-            obj_type = normalize_object_type(raw_type_name, filename=r.get("source_file",""), object_name=obj_name)
+            base_type = normalize_object_type(raw_type_name, filename=r.get("source_file",""), object_name=obj_name)
         else:
             # if raw_type_id is not uuid and looks like type name, normalize directly
             if raw_type_id and not is_uuid(raw_type_id):
-                obj_type = normalize_object_type(raw_type_id, filename=r.get("source_file",""), object_name=obj_name)
+                base_type = normalize_object_type(raw_type_id, filename=r.get("source_file",""), object_name=obj_name)
             else:
                 guessed = guess_type_from_text(r.get("text_sample",""), obj_name, r.get("source_file",""))
-                obj_type = normalize_object_type(guessed, filename=r.get("source_file",""), object_name=obj_name)
-                if obj_type == "WP" and guessed == "Unknown":
-                    obj_type = "Unknown"
+                base_type = normalize_object_type(guessed, filename=r.get("source_file",""), object_name=obj_name)
+
+        # 2) 画像の「Part構成で判定」を適用して修正（特に GUID だけで型が不明なケースや WWP 判定）
+        parts_norm = _canonicalize_parts(r.get("parts") or {})
+        r["parts"] = parts_norm  # 出力列の安定化（Source vs source など）
+        type_by_parts = infer_object_type_from_parts(parts_norm, r.get("parts_all",""), r.get("text_sample",""), raw_type_id)
+
+        obj_type = base_type
+        if type_by_parts:
+            # Folder は最優先
+            if type_by_parts == "Folder":
+                obj_type = "Folder"
+            # WWP は raw が Web Panel でも上書き
+            elif base_type == "WP" and type_by_parts == "WWP":
+                obj_type = "WWP"
+            # raw が Unknown/弱い場合は Parts 判定を採用
+            elif base_type in ("Unknown", ""):
+                obj_type = type_by_parts
 
         src_text = join_sources(list(dict.fromkeys([s for s in r.get("sources", []) if s])), limit=10000)
 
@@ -994,6 +1131,8 @@ def make_feature_names(o: DesignObject) -> List[str]:
 def build_feature_design_rows(objs: List[DesignObject]) -> List[Dict]:
     rows: List[Dict] = []
     for o in objs:
+        if o.object_type == "Folder":
+            continue
         feats = [x.strip() for x in o.feature_names.split(",") if x.strip()] or [f"{o.inferred_entity or o.object_name} 機能"]
         for f in feats:
             rows.append({
@@ -1140,6 +1279,8 @@ def build_design_java_rows(objs: List[DesignObject], java_dir: Path) -> List[Dic
     for o in objs:
         if o.object_type == "Theme":
             continue
+        if o.object_type == "Folder":
+            continue
         rows.extend(match_java_for_object(o.object_name, by_stem, by_token))
     return rows
 
@@ -1201,7 +1342,7 @@ def save_excel(out_path: Path, feature_design: List[Dict], feature_group: List[D
 # -----------------------------
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="GeneXus traceability builder v6 (hierarchy + Source in Parts)")
+    ap = argparse.ArgumentParser(description="GeneXus traceability builder v9 (infer ObjectType by Parts composition)")
     ap.add_argument("--design_dir", required=True, help="Design export directory (may include XPZ/ZIP)")
     ap.add_argument("--java_dir", default="", help="Generated Java source root (optional)")
     ap.add_argument("--out", required=True, help="Output xlsx path")
